@@ -16,6 +16,48 @@ jobs:
       - name: Instalar dependencias
         run: npm install
 
+      - name: "[DIAGNOSTICO TEMPORAL] Ver respuesta cruda del SOAP Retrieve de BusinessUnit"
+        env:
+          SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
+          SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
+          SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+          SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
+        run: |
+          node -e '
+          const { SFMC_CLIENT_ID, SFMC_CLIENT_SECRET, SFMC_SUBDOMAIN, SFMC_PARENT_ACCOUNT_ID } = process.env;
+          const AUTH_URL = `https://${SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`;
+          const SOAP_URL = `https://${SFMC_SUBDOMAIN}.soap.marketingcloudapis.com/Service.asmx`;
+          (async () => {
+            const tokRes = await fetch(AUTH_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ grant_type: "client_credentials", client_id: SFMC_CLIENT_ID, client_secret: SFMC_CLIENT_SECRET, account_id: SFMC_PARENT_ACCOUNT_ID }),
+            });
+            const tok = JSON.parse(await tokRes.text()).access_token;
+            console.log("Token obtenido, largo:", tok ? tok.length : 0);
+            const xml = `<?xml version="1.0" encoding="UTF-8"?>
+          <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+            <soapenv:Header><fueloauth xmlns="http://exacttarget.com">${tok}</fueloauth></soapenv:Header>
+            <soapenv:Body>
+              <RetrieveRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI">
+                <RetrieveRequest>
+                  <ObjectType>BusinessUnit</ObjectType>
+                  <Properties>ID</Properties>
+                  <Properties>Name</Properties>
+                  <Properties>ParentID</Properties>
+                  <Properties>IsActive</Properties>
+                </RetrieveRequest>
+              </RetrieveRequestMsg>
+            </soapenv:Body>
+          </soapenv:Envelope>`;
+            const res = await fetch(SOAP_URL, { method: "POST", headers: { "Content-Type": "text/xml", SOAPAction: "Retrieve" }, body: xml });
+            console.log("HTTP status SOAP:", res.status);
+            const text = await res.text();
+            console.log("Respuesta SOAP cruda:");
+            console.log(text);
+          })().catch(e => { console.error("Error:", e); process.exit(1); });
+          '
+
       - name: Correr conteo
         run: node count-data-extensions.js
         env:
