@@ -214,6 +214,7 @@ async function detectIdentifierFields(buTokenMgr, customerKey) {
   for (const name of fields) {
     if (/subscriber.?key/i.test(name)) idFields.push({ name, type: 'subscriberkey' });
     else if (/^email$|email.?address|^correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
+    else if (/^dni$|documento|^doc$|nro.?doc|numero.?doc/i.test(name)) idFields.push({ name, type: 'dni' });
   }
   return idFields;
 }
@@ -279,6 +280,15 @@ async function main() {
     for (const r of rows) insertRow.run(r.identifier, r.id_type, r.bu_id, r.bu_name, r.de_name, r.customer_key);
   });
   const deleteDeRows = db.prepare('DELETE FROM contact_map WHERE customer_key = ?');
+
+  // Re-evaluar con el patrón de detección actual las DEs que quedaron "skipped"
+  // por no tener campo detectable en una corrida anterior (ej. antes de sumar DNI).
+  const resetSkipped = db
+    .prepare("UPDATE de_progress SET status = 'pending', id_fields = NULL WHERE status = 'skipped' AND id_fields = '[]'")
+    .run();
+  if (resetSkipped.changes > 0) {
+    console.log(`Re-evaluando ${resetSkipped.changes} DE(s) que habían quedado sin identificador con el patrón anterior.`);
+  }
 
   console.log('Autenticando en el nivel Enterprise/Parent...');
   const parentTokenMgr = createTokenManager(SFMC_PARENT_ACCOUNT_ID);
@@ -409,7 +419,10 @@ async function main() {
           for (const f of idFields) {
             const rawVal = flat[f.name];
             if (rawVal === undefined || rawVal === null || String(rawVal).trim() === '') continue;
-            const norm = f.type === 'email' ? String(rawVal).trim().toLowerCase() : String(rawVal).trim();
+            let norm = String(rawVal).trim();
+            if (f.type === 'email') norm = norm.toLowerCase();
+            else if (f.type === 'dni') norm = norm.replace(/\D/g, ''); // saca puntos/guiones para que "12.345.678" y "12345678" matcheen
+            if (norm === '') continue;
             rowsToInsert.push({
               identifier: norm,
               id_type: f.type,

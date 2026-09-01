@@ -78,14 +78,16 @@ function writeDeSummaryCsv() {
 }
 
 function totals() {
-  const bySubKey = db
-    .prepare("SELECT COUNT(DISTINCT identifier) AS n FROM contact_map WHERE id_type = 'subscriberkey'")
-    .get().n;
-  const byEmail = db.prepare("SELECT COUNT(DISTINCT identifier) AS n FROM contact_map WHERE id_type = 'email'").get().n;
-  console.log(`\nSubscriberKeys únicos vistos (en DEs que tienen ese campo): ${bySubKey}`);
-  console.log(`Emails únicos vistos (en DEs que tienen ese campo): ${byEmail}`);
+  const byType = db
+    .prepare('SELECT id_type, COUNT(DISTINCT identifier) AS n FROM contact_map GROUP BY id_type')
+    .all();
+  console.log('');
+  const labels = { subscriberkey: 'SubscriberKeys únicos', email: 'Emails únicos', dni: 'DNIs únicos' };
+  for (const r of byType) {
+    console.log(`${labels[r.id_type] || r.id_type + ' únicos'} vistos (en DEs que tienen ese campo): ${r.n}`);
+  }
   console.log(
-    'Nota: estos dos números NO se suman entre sí — una misma persona puede aparecer contada por SubscriberKey en una DE y por Email en otra sin que se pueda cruzar automáticamente ahí.'
+    'Nota: estos números NO se suman entre sí — una misma persona puede aparecer contada por un tipo de identificador en una DE y por otro tipo en otra, sin que se pueda cruzar automáticamente ahí.'
   );
 }
 
