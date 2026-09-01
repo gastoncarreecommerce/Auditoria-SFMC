@@ -210,11 +210,18 @@ async function detectIdentifierFields(buTokenMgr, customerKey) {
   );
   const fields = (Array.isArray(results) ? results : [results]).filter(Boolean).map((f) => f.Name);
 
+  // Nombres reales vistos en la cuenta: vienen con prefijo/sufijo de sync
+  // con Salesforce (PersonEmail, DNI__c), no solo "Email"/"DNI" a secas —
+  // por eso se busca la palabra en cualquier parte del nombre, excluyendo
+  // campos que contienen la palabra pero no son el identificador en sí
+  // (EmailOptOut, EmailPreference, etc.).
+  const EXCLUDE = /optout|preference|consent|score|bounce|unsub|valid|status|type|flag/i;
   const idFields = [];
   for (const name of fields) {
+    if (EXCLUDE.test(name)) continue;
     if (/subscriber.?key/i.test(name)) idFields.push({ name, type: 'subscriberkey' });
-    else if (/^email$|email.?address|^correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
-    else if (/^dni$|documento|^doc$|nro.?doc|numero.?doc/i.test(name)) idFields.push({ name, type: 'dni' });
+    else if (/dni/i.test(name)) idFields.push({ name, type: 'dni' });
+    else if (/email|correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
   }
   return idFields;
 }
