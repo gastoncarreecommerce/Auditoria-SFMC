@@ -1,0 +1,31 @@
+name: Contar registros de Data Extensions SFMC
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Correr conteo
+        run: node count-data-extensions.js
+        env:
+          SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
+          SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
+          SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+          SFMC_ACCOUNT_ID: ${{ secrets.SFMC_ACCOUNT_ID }}
+
+      - name: Subir CSV como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: de-record-counts
+          path: de-record-counts.csv
