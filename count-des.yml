@@ -22,7 +22,8 @@ jobs:
           SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
           SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
           SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
-          SFMC_ACCOUNT_ID: ${{ secrets.SFMC_ACCOUNT_ID }}
+          SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
+          SFMC_BUSINESS_UNIT_IDS: ${{ secrets.SFMC_BUSINESS_UNIT_IDS }}
 
       - name: Subir CSV como artifact
         uses: actions/upload-artifact@v4
