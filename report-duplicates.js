@@ -77,6 +77,55 @@ function writeDeSummaryCsv() {
   console.log(`contacts-resumen-por-de.csv generado (${perDe.length} filas DE x tipo de identificador).`);
 }
 
+function printDeOverlapRanking() {
+  const rows = db
+    .prepare(
+      `
+    SELECT cm.bu_name, cm.de_name, cm.id_type,
+           COUNT(*) AS filas,
+           SUM(CASE WHEN dup.de_count > 1 THEN 1 ELSE 0 END) AS filas_que_se_repiten_en_otra_de
+    FROM contact_map cm
+    JOIN (
+      SELECT identifier, id_type, COUNT(DISTINCT customer_key) AS de_count
+      FROM contact_map GROUP BY identifier, id_type
+    ) dup ON cm.identifier = dup.identifier AND cm.id_type = dup.id_type
+    GROUP BY cm.customer_key, cm.id_type
+    ORDER BY filas_que_se_repiten_en_otra_de DESC
+    LIMIT 25
+  `
+    )
+    .all();
+
+  console.log('\n=== DEs que más aportan a la duplicación (top 25) ===');
+  for (const r of rows) {
+    const pct = r.filas > 0 ? ((r.filas_que_se_repiten_en_otra_de / r.filas) * 100).toFixed(1) : '0.0';
+    console.log(
+      `  [${r.bu_name}] ${r.de_name} (${r.id_type}): ${r.filas_que_se_repiten_en_otra_de} de ${r.filas} filas (${pct}%) también están en otra DE`
+    );
+  }
+}
+
+function printTopDuplicateIdentifiers() {
+  const rows = db
+    .prepare(
+      `
+    SELECT identifier, id_type, COUNT(DISTINCT customer_key) AS de_count
+    FROM contact_map
+    GROUP BY identifier, id_type
+    HAVING de_count > 1
+    ORDER BY de_count DESC
+    LIMIT 15
+  `
+    )
+    .all();
+  const detailStmt = db.prepare(`SELECT DISTINCT bu_name, de_name FROM contact_map WHERE identifier = ? AND id_type = ?`);
+  console.log('\n=== Identificadores que más se repiten (top 15, en cuántas DEs distintas aparecen) ===');
+  for (const r of rows) {
+    const locs = detailStmt.all(r.identifier, r.id_type).map((x) => x.de_name);
+    console.log(`  (${r.id_type}) presente en ${r.de_count} DEs: ${locs.join(', ')}`);
+  }
+}
+
 function totals() {
   const byType = db
     .prepare('SELECT id_type, COUNT(DISTINCT identifier) AS n FROM contact_map GROUP BY id_type')
@@ -95,4 +144,6 @@ progressSummary();
 totals();
 writeDeSummaryCsv();
 writeDuplicatesCsv();
+printDeOverlapRanking();
+printTopDuplicateIdentifiers();
 db.close();
