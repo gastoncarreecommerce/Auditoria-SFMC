@@ -16,26 +16,34 @@ jobs:
       - name: Instalar dependencias
         run: npm install
 
-      - name: "[DIAGNOSTICO TEMPORAL] Probar auth directo contra SFMC"
+      - name: "[DIAGNOSTICO TEMPORAL] Probar auth con y sin account_id"
         env:
           SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
           SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
           SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+          SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
         run: |
           set +e
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "https://${SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token" \
-            -H "Content-Type: application/json" \
-            -d "{\"grant_type\":\"client_credentials\",\"client_id\":\"${SFMC_CLIENT_ID}\",\"client_secret\":\"${SFMC_CLIENT_SECRET}\"}")
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          echo "HTTP status: $HTTP_CODE"
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "Resultado: OK - auth exitosa a nivel Parent."
-          else
-            ERROR=$(echo "$BODY" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);console.log(j.error+': '+j.error_description)}catch(e){console.log('(no se pudo parsear body)')}})")
-            echo "Resultado: FALLO - $ERROR"
-          fi
+          probar() {
+            local label="$1"; local body="$2"
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              "https://${SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token" \
+              -H "Content-Type: application/json" \
+              -d "$body")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            echo "--- $label ---"
+            echo "HTTP status: $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Resultado: OK"
+            else
+              ERROR=$(echo "$BODY" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);console.log(j.error+': '+j.error_description)}catch(e){console.log('(no se pudo parsear body)')}})")
+              echo "Resultado: FALLO - $ERROR"
+            fi
+          }
+          echo "Longitud de SFMC_PARENT_ACCOUNT_ID: ${#SFMC_PARENT_ACCOUNT_ID} caracteres"
+          probar "SIN account_id" "{\"grant_type\":\"client_credentials\",\"client_id\":\"${SFMC_CLIENT_ID}\",\"client_secret\":\"${SFMC_CLIENT_SECRET}\"}"
+          probar "CON account_id=SFMC_PARENT_ACCOUNT_ID" "{\"grant_type\":\"client_credentials\",\"client_id\":\"${SFMC_CLIENT_ID}\",\"client_secret\":\"${SFMC_CLIENT_SECRET}\",\"account_id\":\"${SFMC_PARENT_ACCOUNT_ID}\"}"
 
       - name: Correr conteo
         run: node count-data-extensions.js
