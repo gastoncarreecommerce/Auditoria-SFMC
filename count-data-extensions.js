@@ -118,6 +118,24 @@ async function listAllDataExtensions(buToken) {
   return results.map((r) => ({ customerKey: r.CustomerKey, name: r.Name }));
 }
 
+// DEs de sistema/tracking que SFMC crea automáticamente (sync con Salesforce,
+// push/mobile, Personalization/Einstein, CloudPages, etc.) — no son audiencias
+// de contactos reales, así que se excluyen del total de contactos.
+const SYSTEM_DE_PATTERNS = [
+  /^_/, // DEs internas de SFMC: _MobileAddress, _PushAddress, _EnterpriseAttribute, etc.
+  /_Salesforce$/, // objetos sincronizados vía Marketing Cloud Connect
+  /^PI_/, // Predictive Intelligence
+  /^IGO_/, // Interaction Studio / Journey tracking
+  /^Einstein_/,
+  /^CloudPages_DataExtension$/,
+  /^ExpressionBuilderAttributes$/,
+  /^MobileLineOrphanContact$/,
+];
+
+function isSystemDE(name) {
+  return SYSTEM_DE_PATTERNS.some((re) => re.test(name));
+}
+
 async function getRowCount(buToken, customerKey) {
   const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(
     customerKey
@@ -174,6 +192,7 @@ async function main() {
         customerKey: de.customerKey,
         count: count ?? null,
         error: error ?? null,
+        esContacto: !isSystemDE(de.name),
       });
       console.log(`  [${i + 1}/${des.length}] ${de.name}: ${error ? 'ERROR ' + error : count}`);
       await sleep(150); // margen de rate-limit
@@ -182,17 +201,28 @@ async function main() {
 
   results.sort((a, b) => (b.count ?? -1) - (a.count ?? -1));
 
-  const csvLines = ['UnidadComercial,MID,NombreDE,CustomerKey,Registros,Error'];
+  const totalContactos = results
+    .filter((r) => r.esContacto)
+    .reduce((sum, r) => sum + (r.count ?? 0), 0);
+
+  const csvLines = ['UnidadComercial,MID,NombreDE,CustomerKey,Registros,EsContacto,Error'];
   for (const r of results) {
     const safeBU = String(r.businessUnitName).replace(/"/g, '""');
     const safeName = String(r.deName).replace(/"/g, '""');
     csvLines.push(
-      `"${safeBU}","${r.businessUnitId}","${safeName}","${r.customerKey}",${r.count ?? ''},${r.error ?? ''}`
+      `"${safeBU}","${r.businessUnitId}","${safeName}","${r.customerKey}",${r.count ?? ''},${
+        r.esContacto ? 'Si' : 'No'
+      },${r.error ?? ''}`
     );
   }
+  csvLines.push(`,,"TOTAL (suma de EsContacto=Si)",,${totalContactos},,`);
   fs.writeFileSync('de-record-counts.csv', csvLines.join('\n'));
 
   console.log('\nListo. Resultado completo en de-record-counts.csv');
+  console.log(
+    `\nTOTAL registros en DEs marcadas como contacto (EsContacto=Si): ${totalContactos}`
+  );
+  console.log('(Nota: puede haber contactos duplicados entre distintas DEs — no es el total único de contactos de la cuenta.)');
   console.log('\nTop 15 por cantidad de registros:');
   results.slice(0, 15).forEach((r) => console.log(`  ${r.count ?? 'ERR'} — [${r.businessUnitName}] ${r.deName}`));
 }
