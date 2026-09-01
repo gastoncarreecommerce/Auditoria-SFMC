@@ -1,0 +1,62 @@
+name: Extraer contactos por DE (para detectar duplicados)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Restaurar progreso de corridas anteriores (contacts.db)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            contacts.db
+            contacts.db-wal
+            contacts.db-shm
+          key: contacts-db-${{ github.run_id }}
+          restore-keys: |
+            contacts-db-
+
+      - name: Extraer contactos (con checkpoint incremental)
+        run: node extract-contacts.js
+        env:
+          SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
+          SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
+          SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+          SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
+          SFMC_BUSINESS_UNIT_IDS: ${{ secrets.SFMC_BUSINESS_UNIT_IDS }}
+          EXTRACT_TIME_BUDGET_MINUTES: "320"
+
+      - name: Guardar progreso para la próxima corrida
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            contacts.db
+            contacts.db-wal
+            contacts.db-shm
+          key: contacts-db-${{ github.run_id }}
+
+      - name: Generar reporte de duplicados
+        if: always()
+        run: node report-duplicates.js
+
+      - name: Subir reportes como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contacts-report
+          path: |
+            contacts-duplicados.csv
+            contacts-resumen-por-de.csv
