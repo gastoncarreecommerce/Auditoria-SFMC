@@ -208,19 +208,25 @@ async function detectIdentifierFields(buTokenMgr, customerKey) {
     ['Name', 'FieldType', 'IsPrimaryKey'],
     { property: 'DataExtension.CustomerKey', value: customerKey }
   );
-  const fields = (Array.isArray(results) ? results : [results]).filter(Boolean).map((f) => f.Name);
+  const fieldList = (Array.isArray(results) ? results : [results]).filter(Boolean);
 
   // Nombres reales vistos en la cuenta: vienen con prefijo/sufijo de sync
-  // con Salesforce (PersonEmail, DNI__c), no solo "Email"/"DNI" a secas —
-  // por eso se busca la palabra en cualquier parte del nombre, excluyendo
-  // campos que contienen la palabra pero no son el identificador en sí
-  // (EmailOptOut, EmailPreference, etc.).
-  const EXCLUDE = /optout|preference|consent|score|bounce|unsub|valid|status|type|flag/i;
+  // con Salesforce (PersonEmail, DNI__c, Otro_documento__c), no solo
+  // "Email"/"DNI" a secas — por eso se busca la palabra en cualquier parte
+  // del nombre. El FieldType filtra los que no pueden ser un identificador
+  // real (Boolean, Date, Decimal, Number) — así se descartan flags como
+  // PersonHasOptedOutOfEmail (Boolean) sin depender de una lista de
+  // palabras prohibidas. "Tipo_DNI__c" (categoría "DNI"/"Pasaporte", no un
+  // número de documento) se excluye por nombre porque igual es tipo Text.
+  const NON_IDENTIFIER_TYPES = /^(boolean|date|decimal|number)$/i;
+  const NOT_AN_IDENTIFIER_NAME = /^tipo|tipo.?doc|tipo.?dni|bounce|reason|optout|prefer|consent|unsub|score/i;
   const idFields = [];
-  for (const name of fields) {
-    if (EXCLUDE.test(name)) continue;
+  for (const f of fieldList) {
+    const name = f.Name;
+    if (NON_IDENTIFIER_TYPES.test(f.FieldType)) continue;
+    if (NOT_AN_IDENTIFIER_NAME.test(name)) continue;
     if (/subscriber.?key/i.test(name)) idFields.push({ name, type: 'subscriberkey' });
-    else if (/dni/i.test(name)) idFields.push({ name, type: 'dni' });
+    else if (/dni|documento|nro.?doc|numero.?doc/i.test(name)) idFields.push({ name, type: 'dni' });
     else if (/email|correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
   }
   return idFields;
@@ -339,8 +345,39 @@ async function main() {
 
       let prog = getProgress.get(de.customerKey);
       if (prog && prog.status === 'done') {
-        console.log(`  [skip] ${de.name}: ya procesada en una corrida anterior.`);
-        continue;
+        // El patrón de detección de campos cambia entre corridas (ej. se
+        // amplió para reconocer "DNI__c"/"PersonEmail"). Un solo Retrieve
+        // de metadata es barato — vale la pena re-chequear antes de dar
+        // por buena una extracción vieja que pudo haberse quedado corta.
+        let freshFields;
+        try {
+          freshFields = await detectIdentifierFields(buTokenMgr, de.customerKey);
+        } catch (err) {
+          console.log(`  [skip] ${de.name}: ya procesada (no se pudo re-chequear campos: ${err.message}).`);
+          continue;
+        }
+        const storedNames = new Set(JSON.parse(prog.id_fields || '[]').map((f) => f.name));
+        const newFields = freshFields.filter((f) => !storedNames.has(f.name));
+        if (newFields.length === 0) {
+          console.log(`  [skip] ${de.name}: ya procesada en una corrida anterior.`);
+          continue;
+        }
+        console.log(
+          `  [re-proceso] ${de.name}: patrón nuevo encontró campo(s) adicional(es) (${newFields
+            .map((f) => `${f.name}(${f.type})`)
+            .join(', ')}), se vuelve a extraer completa.`
+        );
+        deleteDeRows.run(de.customerKey);
+        upsertProgress.run({
+          customer_key: de.customerKey,
+          bu_id: String(bu.id),
+          bu_name: bu.name,
+          de_name: de.name,
+          id_fields: JSON.stringify(freshFields),
+          last_page_done: 0,
+          status: 'in_progress',
+        });
+        prog = getProgress.get(de.customerKey);
       }
       if (prog && prog.status === 'skipped') {
         console.log(`  [skip] ${de.name}: sin campo identificador, marcada como skip.`);
