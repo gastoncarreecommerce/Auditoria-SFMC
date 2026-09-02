@@ -1,0 +1,38 @@
+name: Matriz de solapamiento entre DEs maestras
+
+on:
+  workflow_dispatch:
+    inputs:
+      de_names:
+        description: 'Nombres de DE separados por "|" (vacío = las 6 maestras por defecto)'
+        required: false
+
+jobs:
+  overlap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Restaurar progreso de corridas anteriores (contacts.db)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            contacts.db
+            contacts.db-wal
+            contacts.db-shm
+          key: contacts-db-${{ github.run_id }}
+          restore-keys: |
+            contacts-db-
+
+      - name: Calcular matriz de solapamiento
+        run: node overlap-matrix.js
+        env:
+          OVERLAP_DE_NAMES: ${{ github.event.inputs.de_names }}
