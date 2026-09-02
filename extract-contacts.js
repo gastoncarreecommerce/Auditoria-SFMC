@@ -29,8 +29,9 @@ const START_TIME = Date.now();
 // anterior — de hecho ya se usaba así al resumir una DE a medio bajar),
 // así que se pueden pedir varias páginas a la vez. Configurables por env
 // para poder bajarlos si SFMC empieza a devolver 429.
-const PAGE_CONCURRENCY = Number(EXTRACT_PAGE_CONCURRENCY) || 8;
-const DE_CONCURRENCY = Number(EXTRACT_DE_CONCURRENCY) || 3;
+const PAGE_CONCURRENCY = Number(EXTRACT_PAGE_CONCURRENCY) || 5;
+const DE_CONCURRENCY = Number(EXTRACT_DE_CONCURRENCY) || 2;
+const MAX_FETCH_ATTEMPTS = 6; // reintentos ante rate limit o cortes de red
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
 
@@ -253,21 +254,33 @@ async function fetchRowsetPage(buTokenMgr, customerKey, page, attempt = 0) {
   const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(
     customerKey
   )}/rowset?$pageSize=${PAGE_SIZE}&$page=${page}`;
-  let token = await buTokenMgr.get();
-  let res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (res.status === 401) {
-    buTokenMgr.invalidate();
-    token = await buTokenMgr.get();
-    res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  try {
+    let token = await buTokenMgr.get();
+    let res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 401) {
+      buTokenMgr.invalidate();
+      token = await buTokenMgr.get();
+      res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    }
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      // 4xx (salvo 429) son definitivos: reintentar no cambia nada.
+      err.noRetry = res.status < 500 && res.status !== 429;
+      throw err;
+    }
+    return await res.json();
+  } catch (err) {
+    // Los cortes de red ("fetch failed", ECONNRESET, socket hang up) NO son
+    // un status HTTP: llegan como excepción. Al pedir varias páginas en
+    // paralelo aparecen seguido, y sin este catch se propagaban por el
+    // Promise.all y mataban la DE entera (pasó en la corrida #7: 7 DEs
+    // perdidas, entre ellas BaseMaestra_Ecommerce en la página 41).
+    if (!err.noRetry && attempt < MAX_FETCH_ATTEMPTS) {
+      await sleep(1000 * 2 ** attempt);
+      return fetchRowsetPage(buTokenMgr, customerKey, page, attempt + 1);
+    }
+    throw err;
   }
-  // Al pedir páginas en paralelo aumenta la chance de topar el rate limit;
-  // se reintenta con backoff en vez de dar la DE por fallada.
-  if ((res.status === 429 || res.status >= 500) && attempt < 4) {
-    await sleep(1000 * 2 ** attempt);
-    return fetchRowsetPage(buTokenMgr, customerKey, page, attempt + 1);
-  }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
 }
 
 function openDb() {
