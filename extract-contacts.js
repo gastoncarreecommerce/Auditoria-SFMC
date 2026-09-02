@@ -272,6 +272,16 @@ function openDb() {
       status TEXT NOT NULL DEFAULT 'pending'
     );
   `);
+
+  // row_seq identifica de qué fila de origen salió cada identificador, para
+  // poder enlazar "DNI y Email de la misma persona" cuando una DE tiene
+  // ambos campos en la misma fila (ej. las maestras). Migración manual
+  // porque las bases viejas no tienen esta columna todavía.
+  const cols = db.prepare('PRAGMA table_info(contact_map)').all();
+  if (!cols.some((c) => c.name === 'row_seq')) {
+    db.exec('ALTER TABLE contact_map ADD COLUMN row_seq INTEGER');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_contact_map_row ON contact_map(customer_key, row_seq)');
+  }
   return db;
 }
 
@@ -286,11 +296,11 @@ async function main() {
   `);
   const getProgress = db.prepare('SELECT * FROM de_progress WHERE customer_key = ?');
   const insertRow = db.prepare(`
-    INSERT INTO contact_map (identifier, id_type, bu_id, bu_name, de_name, customer_key)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO contact_map (identifier, id_type, bu_id, bu_name, de_name, customer_key, row_seq)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const insertManyRows = db.transaction((rows) => {
-    for (const r of rows) insertRow.run(r.identifier, r.id_type, r.bu_id, r.bu_name, r.de_name, r.customer_key);
+    for (const r of rows) insertRow.run(r.identifier, r.id_type, r.bu_id, r.bu_name, r.de_name, r.customer_key, r.row_seq);
   });
   const deleteDeRows = db.prepare('DELETE FROM contact_map WHERE customer_key = ?');
 
@@ -458,7 +468,11 @@ async function main() {
         }
 
         const rowsToInsert = [];
-        for (const item of items) {
+        items.forEach((item, idx) => {
+          // Estable entre corridas (no depende del orden de llegada de esta
+          // ejecución puntual): misma página + misma posición en la página
+          // siempre da el mismo row_seq para esta DE.
+          const rowSeq = (page - 1) * PAGE_SIZE + idx;
           const flat = { ...(item.keys || {}), ...(item.values || {}) };
           for (const f of idFields) {
             const rawVal = flat[f.name];
@@ -474,9 +488,10 @@ async function main() {
               bu_name: bu.name,
               de_name: de.name,
               customer_key: de.customerKey,
+              row_seq: rowSeq,
             });
           }
-        }
+        });
         insertManyRows(rowsToInsert);
 
         upsertProgress.run({

@@ -1,7 +1,7 @@
 import fs from 'fs';
 import Database from 'better-sqlite3';
 
-const db = new Database('contacts.db', { readonly: true });
+const db = new Database('contacts.db');
 
 function csvEscape(v) {
   return `"${String(v).replace(/"/g, '""')}"`;
@@ -126,6 +126,129 @@ function printTopDuplicateIdentifiers() {
   }
 }
 
+// Resuelve identidad real cruzando tipos de identificador: si una misma
+// fila de origen tiene DNI y Email juntos (típico en las bases maestras),
+// se los enlaza como la misma persona vía Union-Find. Así el cruce de
+// duplicados deja de estar limitado a "DNI contra DNI" / "Email contra
+// Email" y puede ver a alguien que está en una base maestra (DNI) y
+// también en una campaña chica (Email), sin necesitar una DE puente
+// explícita.
+function resolveIdentitiesAcrossTypes() {
+  console.log('\n=== Resolviendo identidad real (cruzando DNI+Email cuando conviven en la misma fila) ===');
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS identity_nodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id_type TEXT NOT NULL,
+      identifier TEXT NOT NULL,
+      root_id INTEGER,
+      UNIQUE(id_type, identifier)
+    );
+  `);
+  db.exec('DELETE FROM identity_nodes');
+  db.exec('INSERT INTO identity_nodes (id_type, identifier) SELECT DISTINCT id_type, identifier FROM contact_map');
+
+  const nodeCount = db.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM identity_nodes').get().maxId;
+  if (nodeCount === 0) {
+    console.log('  No hay identificadores para resolver todavía.');
+    return;
+  }
+  const parent = new Int32Array(nodeCount + 1);
+  const rank = new Uint8Array(nodeCount + 1);
+  for (let i = 0; i <= nodeCount; i++) parent[i] = i;
+
+  function find(x) {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+  function union(a, b) {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra === rb) return;
+    if (rank[ra] < rank[rb]) parent[ra] = rb;
+    else if (rank[ra] > rank[rb]) parent[rb] = ra;
+    else {
+      parent[rb] = ra;
+      rank[ra]++;
+    }
+  }
+
+  const rowStmt = db.prepare(`
+    SELECT n.id AS node_id, cm.customer_key, cm.row_seq
+    FROM contact_map cm
+    JOIN identity_nodes n ON cm.id_type = n.id_type AND cm.identifier = n.identifier
+    WHERE cm.row_seq IS NOT NULL
+    ORDER BY cm.customer_key, cm.row_seq
+  `);
+
+  let curKey = null;
+  let curSeq = null;
+  let group = [];
+  let rowsSeen = 0;
+  let groupsUnited = 0;
+  const flushGroup = () => {
+    if (group.length > 1) {
+      for (let i = 1; i < group.length; i++) union(group[0], group[i]);
+      groupsUnited++;
+    }
+    group = [];
+  };
+  for (const row of rowStmt.iterate()) {
+    if (row.customer_key !== curKey || row.row_seq !== curSeq) {
+      flushGroup();
+      curKey = row.customer_key;
+      curSeq = row.row_seq;
+    }
+    group.push(row.node_id);
+    rowsSeen++;
+  }
+  flushGroup();
+  console.log(`  ${rowsSeen} filas con row_seq analizadas, ${groupsUnited} fila(s) de origen con más de un tipo de identificador enlazadas.`);
+
+  const updateRoot = db.prepare('UPDATE identity_nodes SET root_id = ? WHERE id = ?');
+  db.transaction(() => {
+    for (let i = 1; i <= nodeCount; i++) updateRoot.run(find(i), i);
+  })();
+  db.exec('CREATE INDEX IF NOT EXISTS idx_identity_nodes_root ON identity_nodes(root_id)');
+
+  const totalPersonas = db.prepare('SELECT COUNT(DISTINCT root_id) AS n FROM identity_nodes').get().n;
+  console.log(`  Personas únicas resueltas (contando DNI+Email de la misma fila como una sola): ${totalPersonas}`);
+
+  const overlapping = db
+    .prepare(
+      `
+    SELECT n.root_id AS root_id, COUNT(DISTINCT cm.customer_key) AS de_count, COUNT(*) AS row_count
+    FROM contact_map cm
+    JOIN identity_nodes n ON cm.id_type = n.id_type AND cm.identifier = n.identifier
+    GROUP BY n.root_id
+    HAVING de_count > 1
+    ORDER BY de_count DESC, row_count DESC
+  `
+    )
+    .all();
+  console.log(`  Personas presentes en más de una DE (cruce real, no solo por tipo): ${overlapping.length}`);
+
+  const lines = ['RootId,EnCuantasDEs,TotalFilas'];
+  for (const r of overlapping) lines.push(`${r.root_id},${r.de_count},${r.row_count}`);
+  fs.writeFileSync('contacts-personas-duplicadas.csv', lines.join('\n'));
+  console.log(`  contacts-personas-duplicadas.csv generado (${overlapping.length} personas).`);
+
+  const desOfRoot = db.prepare(`
+    SELECT DISTINCT cm.bu_name, cm.de_name
+    FROM contact_map cm
+    JOIN identity_nodes n ON cm.id_type = n.id_type AND cm.identifier = n.identifier
+    WHERE n.root_id = ?
+  `);
+  console.log('\n  Top 25 personas presentes en más DEs distintas (cruce real):');
+  for (const r of overlapping.slice(0, 25)) {
+    const des = desOfRoot.all(r.root_id).map((d) => `[${d.bu_name}] ${d.de_name}`);
+    console.log(`    en ${r.de_count} DEs (${r.row_count} filas): ${des.join(', ')}`);
+  }
+}
+
 function totals() {
   const byType = db
     .prepare('SELECT id_type, COUNT(DISTINCT identifier) AS n FROM contact_map GROUP BY id_type')
@@ -146,4 +269,5 @@ writeDeSummaryCsv();
 writeDuplicatesCsv();
 printDeOverlapRanking();
 printTopDuplicateIdentifiers();
+resolveIdentitiesAcrossTypes();
 db.close();

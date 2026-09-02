@@ -6,7 +6,7 @@ on:
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +36,7 @@ jobs:
           SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
           SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
           SFMC_BUSINESS_UNIT_IDS: ${{ secrets.SFMC_BUSINESS_UNIT_IDS }}
-          EXTRACT_TIME_BUDGET_MINUTES: "320"
+          EXTRACT_TIME_BUDGET_MINUTES: "300"
 
       - name: Guardar progreso para la próxima corrida
         if: always()
@@ -68,3 +68,4 @@ jobs:
           path: |
             contacts-duplicados.csv
             contacts-resumen-por-de.csv
+            contacts-personas-duplicadas.csv
