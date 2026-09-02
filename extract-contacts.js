@@ -243,11 +243,34 @@ async function detectIdentifierFields(buTokenMgr, customerKey) {
     const name = f.Name;
     if (NON_IDENTIFIER_TYPES.test(f.FieldType)) continue;
     if (NOT_AN_IDENTIFIER_NAME.test(name)) continue;
-    if (/subscriber.?key/i.test(name)) idFields.push({ name, type: 'subscriberkey' });
+    // ContactKey / SubscriberKey son EL identificador de contacto de SFMC,
+    // pero su nombre no dice qué guardan: en esta cuenta la Clave del
+    // Suscriptor es el DNI (así lo declara la ficha de BaseMaestra_Ecommerce:
+    // "DNI__c se refiere al suscriptor de Clave del suscriptor"), en otras es
+    // el email. En vez de suponerlo, se marcan como 'auto' y el tipo se
+    // deduce del valor real fila por fila (ver classifyKeyValue).
+    if (/subscriber.?key|contact.?key/i.test(name)) idFields.push({ name, type: 'auto' });
     else if (/dni|documento|nro.?doc|numero.?doc/i.test(name)) idFields.push({ name, type: 'dni' });
     else if (/email|correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
   }
   return idFields;
+}
+
+// Para los campos 'auto' (ContactKey/SubscriberKey): clasifica según lo que
+// realmente trae el valor, así cruza con las demás DEs en vez de quedar
+// aislado en un tipo propio.
+//  - con "@"                  -> email
+//  - 7 u 8 dígitos            -> dni (formato de documento argentino)
+//  - cualquier otra cosa      -> subscriberkey (GUID, id interno, etc.)
+// El rango 7-8 es a propósito: evita tomar por DNI a ids numéricos largos.
+function classifyKeyValue(raw) {
+  const value = String(raw).trim();
+  if (value.includes('@')) return { type: 'email', norm: value.toLowerCase() };
+  const digits = value.replace(/\D/g, '');
+  if (digits.length >= 7 && digits.length <= 8 && /^[\d.\-\s]+$/.test(value)) {
+    return { type: 'dni', norm: digits };
+  }
+  return { type: 'subscriberkey', norm: value };
 }
 
 async function fetchRowsetPage(buTokenMgr, customerKey, page, attempt = 0) {
@@ -546,12 +569,16 @@ async function main() {
         const rawVal = flat[f.name] !== undefined ? flat[f.name] : flatLower[f.name.toLowerCase()];
         if (rawVal === undefined || rawVal === null || String(rawVal).trim() === '') continue;
         let norm = String(rawVal).trim();
-        if (f.type === 'email') norm = norm.toLowerCase();
-        else if (f.type === 'dni') norm = norm.replace(/\D/g, ''); // saca puntos/guiones para que "12.345.678" y "12345678" matcheen
+        let type = f.type;
+        if (type === 'auto') {
+          // ContactKey/SubscriberKey: el tipo sale del valor, no del nombre.
+          ({ type, norm } = classifyKeyValue(rawVal));
+        } else if (type === 'email') norm = norm.toLowerCase();
+        else if (type === 'dni') norm = norm.replace(/\D/g, ''); // saca puntos/guiones para que "12.345.678" y "12345678" matcheen
         if (norm === '') continue;
         rows.push({
           identifier: norm,
-          id_type: f.type,
+          id_type: type,
           bu_id: String(bu.id),
           bu_name: bu.name,
           de_name: de.name,
@@ -576,6 +603,8 @@ async function main() {
     let itemsSeenTotal = 0;
     let rowsInsertedTotal = 0;
     let lastLoggedPage = startPage;
+    const typeCounts = {}; // para poder verificar en el log cómo se clasificó
+    // lo que traía un campo 'auto' (ContactKey), en vez de darlo por supuesto
 
     while (!done && !failed) {
       if (timeIsUp()) {
@@ -630,6 +659,7 @@ async function main() {
 
       if (rowsToInsert.length > 0) insertManyRows(rowsToInsert);
       rowsInsertedTotal += rowsToInsert.length;
+      for (const r of rowsToInsert) typeCounts[r.id_type] = (typeCounts[r.id_type] || 0) + 1;
 
       if (lastGoodPage >= page) {
         upsertProgress.run({
@@ -667,8 +697,11 @@ async function main() {
             .join(', ')}) probablemente no matchean las claves reales del rowset. Revisar con inspect-rowset-sample.js.`
         );
       } else {
+        const desglose = Object.entries(typeCounts)
+          .map(([t, n]) => `${n} ${t}`)
+          .join(', ');
         console.log(
-          `    listo: ${de.name} (${page - 1} página(s), ${itemsSeenTotal} filas de origen, ${rowsInsertedTotal} identificador(es) insertados).`
+          `    listo: ${de.name} (${page - 1} página(s), ${itemsSeenTotal} filas de origen, ${rowsInsertedTotal} identificador(es): ${desglose}).`
         );
       }
     }
