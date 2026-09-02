@@ -391,8 +391,47 @@ async function main() {
         prog = getProgress.get(de.customerKey);
       }
       if (prog && prog.status === 'skipped') {
-        console.log(`  [skip] ${de.name}: sin campo identificador, marcada como skip.`);
-        continue;
+        // Igual que con 'done': re-chequear siempre contra el patrón actual
+        // en vez de confiar en el flag guardado. Por el bug viejo de
+        // upsertProgress (ya corregido) varias DEs quedaron con id_fields
+        // en NULL en vez de '[]', así que el reset automático basado en
+        // ese valor no las agarraba — esto las re-evalúa sin depender de
+        // en qué estado haya quedado esa columna históricamente.
+        let freshFields;
+        try {
+          freshFields = await detectIdentifierFields(buTokenMgr, de.customerKey);
+        } catch (err) {
+          console.log(`  [skip] ${de.name}: sin campo identificador (no se pudo re-chequear: ${err.message}).`);
+          continue;
+        }
+        if (freshFields.length === 0) {
+          console.log(`  [skip] ${de.name}: sin campo identificador, marcada como skip.`);
+          upsertProgress.run({
+            customer_key: de.customerKey,
+            bu_id: String(bu.id),
+            bu_name: bu.name,
+            de_name: de.name,
+            id_fields: '[]',
+            last_page_done: 0,
+            status: 'skipped',
+          });
+          continue;
+        }
+        console.log(
+          `  [re-proceso] ${de.name}: patrón nuevo encontró campo(s) (${freshFields
+            .map((f) => `${f.name}(${f.type})`)
+            .join(', ')}), estaba en skip.`
+        );
+        upsertProgress.run({
+          customer_key: de.customerKey,
+          bu_id: String(bu.id),
+          bu_name: bu.name,
+          de_name: de.name,
+          id_fields: JSON.stringify(freshFields),
+          last_page_done: 0,
+          status: 'in_progress',
+        });
+        prog = getProgress.get(de.customerKey);
       }
 
       let idFields;
