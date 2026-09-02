@@ -439,6 +439,8 @@ async function main() {
 
       let page = startPage;
       let done = false;
+      let itemsSeenTotal = 0;
+      let rowsInsertedTotal = 0;
       while (!done) {
         if (timeIsUp()) {
           console.log('\nSe acabó el presupuesto de tiempo de esta corrida a mitad de una DE. Cortando ordenadamente.');
@@ -475,8 +477,18 @@ async function main() {
           // siempre da el mismo row_seq para esta DE.
           const rowSeq = (page - 1) * PAGE_SIZE + idx;
           const flat = { ...(item.keys || {}), ...(item.values || {}) };
+          // El rowset REST devuelve las claves en minúsculas para las DEs
+          // sincronizadas desde Salesforce (ej. "dni__c"), mientras que la
+          // metadata SOAP (DataExtensionField, usada para detectar
+          // idFields) preserva el casing real (ej. "DNI__c"). El lookup
+          // directo por nombre fallaba en silencio para esas DEs — nunca
+          // tiraba error, simplemente no encontraba el valor y saltaba la
+          // fila entera, dejando la DE en 0 filas pese a procesar todas
+          // las páginas igual.
+          const flatLower = {};
+          for (const k in flat) flatLower[k.toLowerCase()] = flat[k];
           for (const f of idFields) {
-            const rawVal = flat[f.name];
+            const rawVal = flat[f.name] !== undefined ? flat[f.name] : flatLower[f.name.toLowerCase()];
             if (rawVal === undefined || rawVal === null || String(rawVal).trim() === '') continue;
             let norm = String(rawVal).trim();
             if (f.type === 'email') norm = norm.toLowerCase();
@@ -494,6 +506,8 @@ async function main() {
           }
         });
         insertManyRows(rowsToInsert);
+        itemsSeenTotal += items.length;
+        rowsInsertedTotal += rowsToInsert.length;
 
         upsertProgress.run({
           customer_key: de.customerKey,
@@ -523,7 +537,15 @@ async function main() {
           last_page_done: page,
           status: 'done',
         });
-        console.log(`    listo (${page} página(s) procesadas).`);
+        if (itemsSeenTotal > 0 && rowsInsertedTotal === 0) {
+          console.log(
+            `    ⚠️  listo (${page} página(s), ${itemsSeenTotal} fila(s) de origen vistas) pero 0 identificadores insertados — los nombres de campo esperados (${idFields
+              .map((f) => f.name)
+              .join(', ')}) probablemente no matchean las claves reales del rowset. Revisar con inspect-rowset-sample.js.`
+          );
+        } else {
+          console.log(`    listo (${page} página(s) procesadas, ${rowsInsertedTotal} identificador(es) insertados).`);
+        }
       }
     }
   }
