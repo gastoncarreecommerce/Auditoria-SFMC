@@ -1,0 +1,41 @@
+name: Inspeccionar campos de una DE puntual
+
+on:
+  workflow_dispatch:
+    inputs:
+      de_name:
+        description: 'Nombre exacto de la DE a inspeccionar (tal cual aparece en el log de extract-contacts.js)'
+        required: true
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Restaurar progreso de corridas anteriores (contacts.db)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            contacts.db
+            contacts.db-wal
+            contacts.db-shm
+          key: contacts-db-${{ github.run_id }}
+          restore-keys: |
+            contacts-db-
+
+      - name: Listar campos de la DE indicada
+        run: node inspect-skipped-fields.js
+        env:
+          SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
+          SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
+          SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+          INSPECT_DE_NAME: ${{ github.event.inputs.de_name }}

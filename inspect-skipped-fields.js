@@ -66,9 +66,12 @@ async function listFields(tokenMgr, customerKey) {
 
 async function main() {
   const db = new Database('contacts.db', { readonly: true });
-  const skipped = db
-    .prepare(`SELECT customer_key, bu_id, bu_name, de_name FROM de_progress WHERE status = 'skipped' AND id_fields = '[]'`)
-    .all();
+  const nameFilter = process.env.INSPECT_DE_NAME;
+  const skipped = nameFilter
+    ? db.prepare(`SELECT customer_key, bu_id, bu_name, de_name FROM de_progress WHERE de_name = ?`).all(nameFilter)
+    : db
+        .prepare(`SELECT customer_key, bu_id, bu_name, de_name FROM de_progress WHERE status = 'skipped' AND id_fields = '[]'`)
+        .all();
   db.close();
 
   console.log(`${skipped.length} DEs sin identificador detectado. Listando sus campos:\n`);
