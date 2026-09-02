@@ -49,7 +49,7 @@ function isSystemDE(name) {
   return SYSTEM_DE_PATTERNS.some((re) => re.test(name));
 }
 
-async function getToken(accountId) {
+async function getTokenRaw(accountId) {
   const body = {
     grant_type: 'client_credentials',
     client_id: SFMC_CLIENT_ID,
@@ -64,7 +64,30 @@ async function getToken(accountId) {
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`Auth falló para account_id=${accountId ?? '(default)'} (${res.status}): ${text}`);
-  return JSON.parse(text).access_token;
+  return JSON.parse(text);
+}
+
+// Los tokens de SFMC expiran a los ~20 minutos. Un manager por BU los renueva
+// solo antes de vencer (y permite forzar renovación si el server igual
+// devuelve "Token Expired"), en vez de pedir uno solo al principio y usarlo
+// para docenas de DEs que pueden tardar más que eso en procesarse.
+function createTokenManager(accountId) {
+  let accessToken = null;
+  let expiresAt = 0;
+  return {
+    async get() {
+      if (!accessToken || Date.now() > expiresAt - 120_000) {
+        const { access_token, expires_in } = await getTokenRaw(accountId);
+        accessToken = access_token;
+        expiresAt = Date.now() + (expires_in || 1200) * 1000;
+      }
+      return accessToken;
+    },
+    invalidate() {
+      accessToken = null;
+      expiresAt = 0;
+    },
+  };
 }
 
 function buildRetrieveXml({ token, objectType, properties, filterProperty, filterValue, continueId }) {
@@ -102,33 +125,57 @@ function buildRetrieveXml({ token, objectType, properties, filterProperty, filte
 </soapenv:Envelope>`;
 }
 
-async function soapRetrieveAll(token, objectType, properties, filter = null) {
+async function soapRequestOnce(token, { objectType, properties, filter, continueId }) {
+  const xml = buildRetrieveXml({
+    token,
+    objectType,
+    properties,
+    filterProperty: filter?.property,
+    filterValue: filter?.value,
+    continueId,
+  });
+  const soapAction = continueId ? 'Continue' : 'Retrieve';
+
+  const res = await fetch(SOAP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml', SOAPAction: soapAction },
+    body: xml,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`SOAP falló (${objectType}, ${res.status}): ${text}`);
+
+  const parsed = parser.parse(text);
+  const body = parsed.Envelope.Body;
+
+  if (body.Fault) {
+    const faultString = body.Fault.faultstring || JSON.stringify(body.Fault);
+    const err = new Error(`SOAP Fault (${objectType}): ${faultString}`);
+    err.isTokenExpired = /token expired/i.test(faultString);
+    throw err;
+  }
+
+  return continueId ? body.ContinueResponseMsg : body.RetrieveResponseMsg;
+}
+
+async function soapRetrieveAll(tokenMgr, objectType, properties, filter = null) {
   let all = [];
   let continueId = null;
   let more = true;
 
   while (more) {
-    const xml = buildRetrieveXml({
-      token,
-      objectType,
-      properties,
-      filterProperty: filter?.property,
-      filterValue: filter?.value,
-      continueId,
-    });
-    const soapAction = continueId ? 'Continue' : 'Retrieve';
-
-    const res = await fetch(SOAP_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/xml', SOAPAction: soapAction },
-      body: xml,
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`SOAP falló (${objectType}, ${res.status}): ${text}`);
-
-    const parsed = parser.parse(text);
-    const body = parsed.Envelope.Body;
-    const msg = continueId ? body.ContinueResponseMsg : body.RetrieveResponseMsg;
+    let token = await tokenMgr.get();
+    let msg;
+    try {
+      msg = await soapRequestOnce(token, { objectType, properties, filter, continueId });
+    } catch (err) {
+      if (err.isTokenExpired) {
+        tokenMgr.invalidate();
+        token = await tokenMgr.get();
+        msg = await soapRequestOnce(token, { objectType, properties, filter, continueId });
+      } else {
+        throw err;
+      }
+    }
 
     let results = msg.Results || [];
     if (!Array.isArray(results)) results = [results];
@@ -143,39 +190,53 @@ async function soapRetrieveAll(token, objectType, properties, filter = null) {
   return all;
 }
 
-async function listBusinessUnits(parentToken) {
-  const results = await soapRetrieveAll(parentToken, 'BusinessUnit', ['ID', 'Name', 'ParentID', 'IsActive']);
+async function listBusinessUnits(parentTokenMgr) {
+  const results = await soapRetrieveAll(parentTokenMgr, 'BusinessUnit', ['ID', 'Name', 'ParentID', 'IsActive']);
   return results.map((r) => ({ id: r.ID, name: r.Name, parentId: r.ParentID, isActive: r.IsActive }));
 }
 
-async function listAllDataExtensions(buToken) {
-  const results = await soapRetrieveAll(buToken, 'DataExtension', ['CustomerKey', 'Name', 'CategoryID']);
+async function listAllDataExtensions(buTokenMgr) {
+  const results = await soapRetrieveAll(buTokenMgr, 'DataExtension', ['CustomerKey', 'Name', 'CategoryID']);
   return results.map((r) => ({ customerKey: r.CustomerKey, name: r.Name }));
 }
 
 // Detecta qué campo(s) de la DE sirven como identificador de contacto.
-async function detectIdentifierFields(buToken, customerKey) {
+async function detectIdentifierFields(buTokenMgr, customerKey) {
   const results = await soapRetrieveAll(
-    buToken,
+    buTokenMgr,
     'DataExtensionField',
     ['Name', 'FieldType', 'IsPrimaryKey'],
     { property: 'DataExtension.CustomerKey', value: customerKey }
   );
   const fields = (Array.isArray(results) ? results : [results]).filter(Boolean).map((f) => f.Name);
 
+  // Nombres reales vistos en la cuenta: vienen con prefijo/sufijo de sync
+  // con Salesforce (PersonEmail, DNI__c), no solo "Email"/"DNI" a secas —
+  // por eso se busca la palabra en cualquier parte del nombre, excluyendo
+  // campos que contienen la palabra pero no son el identificador en sí
+  // (EmailOptOut, EmailPreference, etc.).
+  const EXCLUDE = /optout|preference|consent|score|bounce|unsub|valid|status|type|flag/i;
   const idFields = [];
   for (const name of fields) {
+    if (EXCLUDE.test(name)) continue;
     if (/subscriber.?key/i.test(name)) idFields.push({ name, type: 'subscriberkey' });
-    else if (/^email$|email.?address|^correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
+    else if (/dni/i.test(name)) idFields.push({ name, type: 'dni' });
+    else if (/email|correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
   }
   return idFields;
 }
 
-async function fetchRowsetPage(buToken, customerKey, page) {
+async function fetchRowsetPage(buTokenMgr, customerKey, page) {
   const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(
     customerKey
   )}/rowset?$pageSize=${PAGE_SIZE}&$page=${page}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${buToken}` } });
+  let token = await buTokenMgr.get();
+  let res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (res.status === 401) {
+    buTokenMgr.invalidate();
+    token = await buTokenMgr.get();
+    res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -227,11 +288,21 @@ async function main() {
   });
   const deleteDeRows = db.prepare('DELETE FROM contact_map WHERE customer_key = ?');
 
+  // Re-evaluar con el patrón de detección actual las DEs que quedaron "skipped"
+  // por no tener campo detectable en una corrida anterior (ej. antes de sumar DNI).
+  const resetSkipped = db
+    .prepare("UPDATE de_progress SET status = 'pending', id_fields = NULL WHERE status = 'skipped' AND id_fields = '[]'")
+    .run();
+  if (resetSkipped.changes > 0) {
+    console.log(`Re-evaluando ${resetSkipped.changes} DE(s) que habían quedado sin identificador con el patrón anterior.`);
+  }
+
   console.log('Autenticando en el nivel Enterprise/Parent...');
-  const parentToken = await getToken(SFMC_PARENT_ACCOUNT_ID);
+  const parentTokenMgr = createTokenManager(SFMC_PARENT_ACCOUNT_ID);
+  await parentTokenMgr.get();
 
   console.log('Listando Business Units...');
-  let businessUnits = await listBusinessUnits(parentToken);
+  let businessUnits = await listBusinessUnits(parentTokenMgr);
   if (SFMC_BUSINESS_UNIT_IDS) {
     const allowed = new Set(SFMC_BUSINESS_UNIT_IDS.split(',').map((s) => s.trim()));
     businessUnits = businessUnits.filter((bu) => allowed.has(String(bu.id)));
@@ -241,9 +312,9 @@ async function main() {
 
   outer: for (const bu of businessUnits) {
     console.log(`\n--- BU: ${bu.name} (MID ${bu.id}) ---`);
-    let buToken;
+    const buTokenMgr = createTokenManager(bu.id);
     try {
-      buToken = await getToken(bu.id);
+      await buTokenMgr.get();
     } catch (err) {
       console.log(`  No se pudo autenticar contra esta BU: ${err.message}`);
       continue;
@@ -251,7 +322,7 @@ async function main() {
 
     let des;
     try {
-      des = await listAllDataExtensions(buToken);
+      des = await listAllDataExtensions(buTokenMgr);
     } catch (err) {
       console.log(`  Error listando DEs: ${err.message}`);
       continue;
@@ -281,7 +352,7 @@ async function main() {
         idFields = JSON.parse(prog.id_fields);
       } else {
         try {
-          idFields = await detectIdentifierFields(buToken, de.customerKey);
+          idFields = await detectIdentifierFields(buTokenMgr, de.customerKey);
         } catch (err) {
           console.log(`  [error] ${de.name}: no se pudieron leer los campos (${err.message})`);
           continue;
@@ -328,7 +399,7 @@ async function main() {
         }
         let data;
         try {
-          data = await fetchRowsetPage(buToken, de.customerKey, page);
+          data = await fetchRowsetPage(buTokenMgr, de.customerKey, page);
         } catch (err) {
           console.log(`    página ${page}: ERROR ${err.message} — se marca la DE como error y se sigue con la próxima.`);
           upsertProgress.run({
@@ -355,7 +426,10 @@ async function main() {
           for (const f of idFields) {
             const rawVal = flat[f.name];
             if (rawVal === undefined || rawVal === null || String(rawVal).trim() === '') continue;
-            const norm = f.type === 'email' ? String(rawVal).trim().toLowerCase() : String(rawVal).trim();
+            let norm = String(rawVal).trim();
+            if (f.type === 'email') norm = norm.toLowerCase();
+            else if (f.type === 'dni') norm = norm.replace(/\D/g, ''); // saca puntos/guiones para que "12.345.678" y "12345678" matcheen
+            if (norm === '') continue;
             rowsToInsert.push({
               identifier: norm,
               id_type: f.type,

@@ -52,6 +52,14 @@ jobs:
         if: always()
         run: node report-duplicates.js
 
+      - name: Listar campos de las DEs sin identificador detectado
+        if: always()
+        run: node inspect-skipped-fields.js
+        env:
+          SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
+          SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
+          SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+
       - name: Subir reportes como artifact
         if: always()
         uses: actions/upload-artifact@v4
