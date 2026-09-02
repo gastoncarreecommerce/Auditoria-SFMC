@@ -21,7 +21,34 @@ function progressSummary() {
   }
 }
 
+// Escribe el CSV incrementalmente. Antes se armaba el archivo entero como un
+// solo string y con estos volúmenes (millones de filas) reventaba con
+// "RangeError: Invalid string length" al superar el máximo de V8. El buffer
+// acotado mantiene el uso de memoria plano sin importar cuántas filas haya.
+function createCsvWriter(path, header) {
+  const fd = fs.openSync(path, 'w');
+  let buf = header + '\n';
+  let count = 0;
+  return {
+    write(line) {
+      buf += line + '\n';
+      count++;
+      if (buf.length > 4 * 1024 * 1024) {
+        fs.writeSync(fd, buf);
+        buf = '';
+      }
+    },
+    close() {
+      if (buf) fs.writeSync(fd, buf);
+      fs.closeSync(fd);
+      return count;
+    },
+  };
+}
+
 function writeDuplicatesCsv() {
+  // .iterate() en vez de .all(): la consulta puede devolver millones de filas
+  // y cargarlas todas en un array las duplica en memoria al pedo.
   const dupIdentifiers = db
     .prepare(
       `
@@ -32,25 +59,25 @@ function writeDuplicatesCsv() {
     ORDER BY de_count DESC, row_count DESC
   `
     )
-    .all();
+    .iterate();
 
   const detailStmt = db.prepare(
     `SELECT DISTINCT bu_name, de_name FROM contact_map WHERE identifier = ? AND id_type = ?`
   );
 
-  const lines = ['Identificador,Tipo,EnCuantasDEs,TotalFilas,UnidadesYDEs'];
+  const csv = createCsvWriter('contacts-duplicados.csv', 'Identificador,Tipo,EnCuantasDEs,TotalFilas,UnidadesYDEs');
   for (const d of dupIdentifiers) {
     const locations = detailStmt
       .all(d.identifier, d.id_type)
       .map((r) => `${r.bu_name} / ${r.de_name}`)
       .join(' | ');
-    lines.push(
+    csv.write(
       `${csvEscape(d.identifier)},${csvEscape(d.id_type)},${d.de_count},${d.row_count},${csvEscape(locations)}`
     );
   }
-  fs.writeFileSync('contacts-duplicados.csv', lines.join('\n'));
-  console.log(`\ncontacts-duplicados.csv generado: ${dupIdentifiers.length} identificadores repetidos en más de una DE.`);
-  return dupIdentifiers.length;
+  const n = csv.close();
+  console.log(`\ncontacts-duplicados.csv generado: ${n} identificadores repetidos en más de una DE.`);
+  return n;
 }
 
 function writeDeSummaryCsv() {
@@ -65,16 +92,19 @@ function writeDeSummaryCsv() {
     ORDER BY bu_name, de_name
   `
     )
-    .all();
+    .iterate();
 
-  const lines = ['UnidadComercial,NombreDE,TipoIdentificador,FilasExtraidas,IdentificadoresUnicosEnEstaDE'];
+  const csv = createCsvWriter(
+    'contacts-resumen-por-de.csv',
+    'UnidadComercial,NombreDE,TipoIdentificador,FilasExtraidas,IdentificadoresUnicosEnEstaDE'
+  );
   for (const r of perDe) {
-    lines.push(
+    csv.write(
       `${csvEscape(r.bu_name)},${csvEscape(r.de_name)},${csvEscape(r.id_type)},${r.filas_extraidas},${r.identificadores_unicos}`
     );
   }
-  fs.writeFileSync('contacts-resumen-por-de.csv', lines.join('\n'));
-  console.log(`contacts-resumen-por-de.csv generado (${perDe.length} filas DE x tipo de identificador).`);
+  const n = csv.close();
+  console.log(`contacts-resumen-por-de.csv generado (${n} filas DE x tipo de identificador).`);
 }
 
 function printDeOverlapRanking() {
@@ -217,6 +247,9 @@ function resolveIdentitiesAcrossTypes() {
   const totalPersonas = db.prepare('SELECT COUNT(DISTINCT root_id) AS n FROM identity_nodes').get().n;
   console.log(`  Personas únicas resueltas (contando DNI+Email de la misma fila como una sola): ${totalPersonas}`);
 
+  // Se recorre en streaming y se escribe al vuelo: esta consulta puede
+  // devolver millones de personas y cargarlas en un array (más el string del
+  // CSV entero) era justamente lo que reventaba la memoria.
   const overlapping = db
     .prepare(
       `
@@ -228,13 +261,17 @@ function resolveIdentitiesAcrossTypes() {
     ORDER BY de_count DESC, row_count DESC
   `
     )
-    .all();
-  console.log(`  Personas presentes en más de una DE (cruce real, no solo por tipo): ${overlapping.length}`);
+    .iterate();
 
-  const lines = ['RootId,EnCuantasDEs,TotalFilas'];
-  for (const r of overlapping) lines.push(`${r.root_id},${r.de_count},${r.row_count}`);
-  fs.writeFileSync('contacts-personas-duplicadas.csv', lines.join('\n'));
-  console.log(`  contacts-personas-duplicadas.csv generado (${overlapping.length} personas).`);
+  const csv = createCsvWriter('contacts-personas-duplicadas.csv', 'RootId,EnCuantasDEs,TotalFilas');
+  const top = []; // el ranking se arma sobre la marcha, acotado a 25
+  for (const r of overlapping) {
+    csv.write(`${r.root_id},${r.de_count},${r.row_count}`);
+    if (top.length < 25) top.push(r);
+  }
+  const totalOverlapping = csv.close();
+  console.log(`  Personas presentes en más de una DE (cruce real, no solo por tipo): ${totalOverlapping}`);
+  console.log(`  contacts-personas-duplicadas.csv generado (${totalOverlapping} personas).`);
 
   const desOfRoot = db.prepare(`
     SELECT DISTINCT cm.bu_name, cm.de_name
@@ -243,7 +280,7 @@ function resolveIdentitiesAcrossTypes() {
     WHERE n.root_id = ?
   `);
   console.log('\n  Top 25 personas presentes en más DEs distintas (cruce real):');
-  for (const r of overlapping.slice(0, 25)) {
+  for (const r of top) {
     const des = desOfRoot.all(r.root_id).map((d) => `[${d.bu_name}] ${d.de_name}`);
     console.log(`    en ${r.de_count} DEs (${r.row_count} filas): ${des.join(', ')}`);
   }

@@ -37,11 +37,13 @@ jobs:
           SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
           SFMC_BUSINESS_UNIT_IDS: ${{ secrets.SFMC_BUSINESS_UNIT_IDS }}
           EXTRACT_TIME_BUDGET_MINUTES: "300"
-          # Paralelismo. Máximo de pedidos REST simultáneos = DE x PAGE (3x8=24),
-          # muy por debajo del límite de SFMC. Si igual aparecieran 429 en el log
-          # (se reintentan solos con backoff), bajar estos números.
-          EXTRACT_PAGE_CONCURRENCY: "8"
-          EXTRACT_DE_CONCURRENCY: "3"
+          # Paralelismo: máximo de pedidos REST simultáneos = DE x PAGE (2x5=10).
+          # En la corrida #7 se probó con 24 y, si bien la velocidad fue 15x,
+          # SFMC empezó a cortar conexiones ("fetch failed") y se perdieron 7
+          # DEs. Ahora esos cortes se reintentan solos, pero además se baja la
+          # concurrencia para que aparezcan menos.
+          EXTRACT_PAGE_CONCURRENCY: "5"
+          EXTRACT_DE_CONCURRENCY: "2"
 
       - name: Guardar progreso para la próxima corrida
         if: always()
