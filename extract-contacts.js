@@ -291,6 +291,7 @@ async function main() {
     INSERT INTO de_progress (customer_key, bu_id, bu_name, de_name, id_fields, last_page_done, status)
     VALUES (@customer_key, @bu_id, @bu_name, @de_name, @id_fields, @last_page_done, @status)
     ON CONFLICT(customer_key) DO UPDATE SET
+      id_fields = excluded.id_fields,
       last_page_done = excluded.last_page_done,
       status = excluded.status
   `);
