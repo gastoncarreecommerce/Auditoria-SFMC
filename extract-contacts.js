@@ -10,6 +10,8 @@ const {
   SFMC_BUSINESS_UNIT_IDS,
   EXTRACT_PAGE_SIZE,
   EXTRACT_TIME_BUDGET_MINUTES, // corta el proceso ordenadamente antes de que lo mate el timeout del job
+  EXTRACT_PAGE_CONCURRENCY, // páginas pedidas en paralelo dentro de una misma DE
+  EXTRACT_DE_CONCURRENCY, // DEs procesadas en paralelo
 } = process.env;
 
 if (!SFMC_CLIENT_ID || !SFMC_CLIENT_SECRET || !SFMC_SUBDOMAIN) {
@@ -23,6 +25,12 @@ const REST_BASE = `https://${SFMC_SUBDOMAIN}.rest.marketingcloudapis.com`;
 const PAGE_SIZE = Number(EXTRACT_PAGE_SIZE) || 2500;
 const TIME_BUDGET_MS = (Number(EXTRACT_TIME_BUDGET_MINUTES) || 320) * 60 * 1000;
 const START_TIME = Date.now();
+// El endpoint rowset acepta $page=N directo (no depende de la página
+// anterior — de hecho ya se usaba así al resumir una DE a medio bajar),
+// así que se pueden pedir varias páginas a la vez. Configurables por env
+// para poder bajarlos si SFMC empieza a devolver 429.
+const PAGE_CONCURRENCY = Number(EXTRACT_PAGE_CONCURRENCY) || 8;
+const DE_CONCURRENCY = Number(EXTRACT_DE_CONCURRENCY) || 3;
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
 
@@ -74,14 +82,23 @@ async function getTokenRaw(accountId) {
 function createTokenManager(accountId) {
   let accessToken = null;
   let expiresAt = 0;
+  let inFlight = null; // dedupe: con pedidos en paralelo, al vencer el token
+  // todos entrarían a renovarlo a la vez y dispararían N auths innecesarias.
   return {
     async get() {
-      if (!accessToken || Date.now() > expiresAt - 120_000) {
-        const { access_token, expires_in } = await getTokenRaw(accountId);
-        accessToken = access_token;
-        expiresAt = Date.now() + (expires_in || 1200) * 1000;
+      if (accessToken && Date.now() < expiresAt - 120_000) return accessToken;
+      if (!inFlight) {
+        inFlight = getTokenRaw(accountId)
+          .then(({ access_token, expires_in }) => {
+            accessToken = access_token;
+            expiresAt = Date.now() + (expires_in || 1200) * 1000;
+            return accessToken;
+          })
+          .finally(() => {
+            inFlight = null;
+          });
       }
-      return accessToken;
+      return inFlight;
     },
     invalidate() {
       accessToken = null;
@@ -232,7 +249,7 @@ async function detectIdentifierFields(buTokenMgr, customerKey) {
   return idFields;
 }
 
-async function fetchRowsetPage(buTokenMgr, customerKey, page) {
+async function fetchRowsetPage(buTokenMgr, customerKey, page, attempt = 0) {
   const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(
     customerKey
   )}/rowset?$pageSize=${PAGE_SIZE}&$page=${page}`;
@@ -243,6 +260,12 @@ async function fetchRowsetPage(buTokenMgr, customerKey, page) {
     token = await buTokenMgr.get();
     res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   }
+  // Al pedir páginas en paralelo aumenta la chance de topar el rate limit;
+  // se reintenta con backoff en vez de dar la DE por fallada.
+  if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+    await sleep(1000 * 2 ** attempt);
+    return fetchRowsetPage(buTokenMgr, customerKey, page, attempt + 1);
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -250,6 +273,14 @@ async function fetchRowsetPage(buTokenMgr, customerKey, page) {
 function openDb() {
   const db = new Database('contacts.db');
   db.pragma('journal_mode = WAL');
+  // Con WAL + synchronous=NORMAL se deja de hacer fsync en cada commit (el
+  // cuello de botella real: ~980 inserts/seg medidos en la corrida #6).
+  // El riesgo que queda es perder los últimos commits ante un corte de luz
+  // del runner, no ante una caída del proceso — y en ese caso simplemente
+  // se vuelve a extraer esa DE.
+  db.pragma('synchronous = NORMAL');
+  db.pragma('cache_size = -200000'); // ~200 MB de caché de páginas
+  db.pragma('temp_store = MEMORY');
   db.exec(`
     CREATE TABLE IF NOT EXISTS contact_map (
       identifier TEXT NOT NULL,
@@ -326,6 +357,10 @@ async function main() {
   }
 
   let stoppedEarly = false;
+  // Fase 1 (secuencial y rápida): decidir qué DEs hay que extraer y con qué
+  // campos. Fase 2 (abajo): bajarlas en paralelo. Separarlo evita que las
+  // decisiones de estado (que escriben en SQLite) se pisen entre workers.
+  const workQueue = [];
 
   outer: for (const bu of businessUnits) {
     console.log(`\n--- BU: ${bu.name} (MID ${bu.id}) ---`);
@@ -470,123 +505,180 @@ async function main() {
       }
 
       const startPage = (prog.last_page_done || 0) + 1;
-      console.log(
-        `  [${startPage === 1 ? 'inicio' : 'resume pág ' + startPage}] ${de.name} — identificador(es): ${idFields
-          .map((f) => `${f.name}(${f.type})`)
-          .join(', ')}`
-      );
+      workQueue.push({ bu, buTokenMgr, de, idFields, startPage });
+    }
+  }
 
-      let page = startPage;
-      let done = false;
-      let itemsSeenTotal = 0;
-      let rowsInsertedTotal = 0;
-      while (!done) {
-        if (timeIsUp()) {
-          console.log('\nSe acabó el presupuesto de tiempo de esta corrida a mitad de una DE. Cortando ordenadamente.');
-          stoppedEarly = true;
-          break outer;
-        }
-        let data;
-        try {
-          data = await fetchRowsetPage(buTokenMgr, de.customerKey, page);
-        } catch (err) {
-          console.log(`    página ${page}: ERROR ${err.message} — se marca la DE como error y se sigue con la próxima.`);
-          upsertProgress.run({
-            customer_key: de.customerKey,
-            bu_id: String(bu.id),
-            bu_name: bu.name,
-            de_name: de.name,
-            id_fields: JSON.stringify(idFields),
-            last_page_done: page - 1,
-            status: 'error',
-          });
-          break;
-        }
+  // --- Fase 2: extracción propiamente dicha, en paralelo ---
+  // Convierte cada fila del rowset en las filas de contact_map que le
+  // corresponden (una por campo identificador con valor).
+  function rowsFromItems(items, page, bu, de, idFields) {
+    const rows = [];
+    items.forEach((item, idx) => {
+      // Estable entre corridas (no depende del orden de llegada de esta
+      // ejecución puntual): misma página + misma posición en la página
+      // siempre da el mismo row_seq para esta DE.
+      const rowSeq = (page - 1) * PAGE_SIZE + idx;
+      const flat = { ...(item.keys || {}), ...(item.values || {}) };
+      // El rowset REST devuelve las claves en minúsculas para las DEs
+      // sincronizadas desde Salesforce (ej. "dni__c"), mientras que la
+      // metadata SOAP (DataExtensionField, usada para detectar idFields)
+      // preserva el casing real (ej. "DNI__c"). El lookup directo por
+      // nombre fallaba en silencio para esas DEs — nunca tiraba error,
+      // simplemente no encontraba el valor y saltaba la fila entera,
+      // dejando la DE en 0 filas pese a procesar todas las páginas igual.
+      const flatLower = {};
+      for (const k in flat) flatLower[k.toLowerCase()] = flat[k];
+      for (const f of idFields) {
+        const rawVal = flat[f.name] !== undefined ? flat[f.name] : flatLower[f.name.toLowerCase()];
+        if (rawVal === undefined || rawVal === null || String(rawVal).trim() === '') continue;
+        let norm = String(rawVal).trim();
+        if (f.type === 'email') norm = norm.toLowerCase();
+        else if (f.type === 'dni') norm = norm.replace(/\D/g, ''); // saca puntos/guiones para que "12.345.678" y "12345678" matcheen
+        if (norm === '') continue;
+        rows.push({
+          identifier: norm,
+          id_type: f.type,
+          bu_id: String(bu.id),
+          bu_name: bu.name,
+          de_name: de.name,
+          customer_key: de.customerKey,
+          row_seq: rowSeq,
+        });
+      }
+    });
+    return rows;
+  }
 
+  async function processDE({ bu, buTokenMgr, de, idFields, startPage }) {
+    console.log(
+      `  [${startPage === 1 ? 'inicio' : 'resume pág ' + startPage}] ${de.name} — identificador(es): ${idFields
+        .map((f) => `${f.name}(${f.type})`)
+        .join(', ')}`
+    );
+
+    let page = startPage;
+    let done = false;
+    let failed = false;
+    let itemsSeenTotal = 0;
+    let rowsInsertedTotal = 0;
+    let lastLoggedPage = startPage;
+
+    while (!done && !failed) {
+      if (timeIsUp()) {
+        console.log(`    ${de.name}: se acabó el presupuesto de tiempo (quedó en la página ${page - 1}).`);
+        stoppedEarly = true;
+        return;
+      }
+
+      // Se piden PAGE_CONCURRENCY páginas a la vez. El checkpoint sólo
+      // avanza hasta la última página consecutiva confirmada del lote, así
+      // que un corte a mitad de lote reanuda sin saltearse nada.
+      const batch = [];
+      for (let i = 0; i < PAGE_CONCURRENCY; i++) batch.push(page + i);
+
+      let results;
+      try {
+        results = await Promise.all(
+          batch.map((p) => fetchRowsetPage(buTokenMgr, de.customerKey, p).then((data) => ({ page: p, data })))
+        );
+      } catch (err) {
+        console.log(`    ${de.name} — página ~${page}: ERROR ${err.message} — se marca la DE como error y se sigue con la próxima.`);
+        upsertProgress.run({
+          customer_key: de.customerKey,
+          bu_id: String(bu.id),
+          bu_name: bu.name,
+          de_name: de.name,
+          id_fields: JSON.stringify(idFields),
+          last_page_done: page - 1,
+          status: 'error',
+        });
+        failed = true;
+        break;
+      }
+
+      results.sort((a, b) => a.page - b.page);
+      const rowsToInsert = [];
+      let lastGoodPage = page - 1;
+      for (const { page: p, data } of results) {
         const items = data.items || [];
         if (items.length === 0) {
           done = true;
-          break;
+          break; // no hay más datos: las páginas siguientes del lote tampoco tienen
         }
-
-        const rowsToInsert = [];
-        items.forEach((item, idx) => {
-          // Estable entre corridas (no depende del orden de llegada de esta
-          // ejecución puntual): misma página + misma posición en la página
-          // siempre da el mismo row_seq para esta DE.
-          const rowSeq = (page - 1) * PAGE_SIZE + idx;
-          const flat = { ...(item.keys || {}), ...(item.values || {}) };
-          // El rowset REST devuelve las claves en minúsculas para las DEs
-          // sincronizadas desde Salesforce (ej. "dni__c"), mientras que la
-          // metadata SOAP (DataExtensionField, usada para detectar
-          // idFields) preserva el casing real (ej. "DNI__c"). El lookup
-          // directo por nombre fallaba en silencio para esas DEs — nunca
-          // tiraba error, simplemente no encontraba el valor y saltaba la
-          // fila entera, dejando la DE en 0 filas pese a procesar todas
-          // las páginas igual.
-          const flatLower = {};
-          for (const k in flat) flatLower[k.toLowerCase()] = flat[k];
-          for (const f of idFields) {
-            const rawVal = flat[f.name] !== undefined ? flat[f.name] : flatLower[f.name.toLowerCase()];
-            if (rawVal === undefined || rawVal === null || String(rawVal).trim() === '') continue;
-            let norm = String(rawVal).trim();
-            if (f.type === 'email') norm = norm.toLowerCase();
-            else if (f.type === 'dni') norm = norm.replace(/\D/g, ''); // saca puntos/guiones para que "12.345.678" y "12345678" matcheen
-            if (norm === '') continue;
-            rowsToInsert.push({
-              identifier: norm,
-              id_type: f.type,
-              bu_id: String(bu.id),
-              bu_name: bu.name,
-              de_name: de.name,
-              customer_key: de.customerKey,
-              row_seq: rowSeq,
-            });
-          }
-        });
-        insertManyRows(rowsToInsert);
+        rowsToInsert.push(...rowsFromItems(items, p, bu, de, idFields));
         itemsSeenTotal += items.length;
-        rowsInsertedTotal += rowsToInsert.length;
-
-        upsertProgress.run({
-          customer_key: de.customerKey,
-          bu_id: String(bu.id),
-          bu_name: bu.name,
-          de_name: de.name,
-          id_fields: JSON.stringify(idFields),
-          last_page_done: page,
-          status: 'in_progress',
-        });
-
+        lastGoodPage = p;
         if (items.length < PAGE_SIZE) {
           done = true;
-        } else {
-          page += 1;
-          await sleep(100);
+          break; // última página parcial
         }
       }
 
-      if (done) {
+      if (rowsToInsert.length > 0) insertManyRows(rowsToInsert);
+      rowsInsertedTotal += rowsToInsert.length;
+
+      if (lastGoodPage >= page) {
         upsertProgress.run({
           customer_key: de.customerKey,
           bu_id: String(bu.id),
           bu_name: bu.name,
           de_name: de.name,
           id_fields: JSON.stringify(idFields),
-          last_page_done: page,
-          status: 'done',
+          last_page_done: lastGoodPage,
+          status: 'in_progress',
         });
-        if (itemsSeenTotal > 0 && rowsInsertedTotal === 0) {
-          console.log(
-            `    ⚠️  listo (${page} página(s), ${itemsSeenTotal} fila(s) de origen vistas) pero 0 identificadores insertados — los nombres de campo esperados (${idFields
-              .map((f) => f.name)
-              .join(', ')}) probablemente no matchean las claves reales del rowset. Revisar con inspect-rowset-sample.js.`
-          );
-        } else {
-          console.log(`    listo (${page} página(s) procesadas, ${rowsInsertedTotal} identificador(es) insertados).`);
-        }
+        page = lastGoodPage + 1;
+      }
+
+      if (!done && page - lastLoggedPage >= 200) {
+        console.log(`    ${de.name}: ${page - 1} páginas, ${rowsInsertedTotal} identificadores...`);
+        lastLoggedPage = page;
       }
     }
+
+    if (done) {
+      upsertProgress.run({
+        customer_key: de.customerKey,
+        bu_id: String(bu.id),
+        bu_name: bu.name,
+        de_name: de.name,
+        id_fields: JSON.stringify(idFields),
+        last_page_done: page - 1,
+        status: 'done',
+      });
+      if (itemsSeenTotal > 0 && rowsInsertedTotal === 0) {
+        console.log(
+          `    ⚠️  ${de.name}: listo (${page - 1} página(s), ${itemsSeenTotal} fila(s) de origen vistas) pero 0 identificadores insertados — los nombres de campo esperados (${idFields
+            .map((f) => f.name)
+            .join(', ')}) probablemente no matchean las claves reales del rowset. Revisar con inspect-rowset-sample.js.`
+        );
+      } else {
+        console.log(
+          `    listo: ${de.name} (${page - 1} página(s), ${itemsSeenTotal} filas de origen, ${rowsInsertedTotal} identificador(es) insertados).`
+        );
+      }
+    }
+  }
+
+  if (workQueue.length > 0) {
+    console.log(
+      `\n=== Extrayendo ${workQueue.length} DE(s): ${DE_CONCURRENCY} en paralelo, ${PAGE_CONCURRENCY} páginas a la vez cada una ===`
+    );
+    let next = 0;
+    const workers = [];
+    for (let i = 0; i < Math.min(DE_CONCURRENCY, workQueue.length); i++) {
+      workers.push(
+        (async () => {
+          while (next < workQueue.length && !timeIsUp()) {
+            const item = workQueue[next++];
+            await processDE(item);
+          }
+        })()
+      );
+    }
+    await Promise.all(workers);
+    if (next < workQueue.length) stoppedEarly = true;
   }
 
   db.close();
