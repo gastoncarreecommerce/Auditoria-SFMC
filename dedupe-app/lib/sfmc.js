@@ -118,69 +118,98 @@ export async function listContactDataExtensions() {
   return results.filter((r) => !isSystemDE(r.Name)).map((r) => ({ customerKey: r.CustomerKey, name: r.Name }));
 }
 
-// Campos que realmente identifican la fila en SFMC (no los que detectamos
-// como "parecen DNI/email" en la auditoría — acá hace falta la clave
-// primaria real, la que exige SFMC para poder borrar).
-export async function getPrimaryKeyFields(customerKey) {
+// Misma heurística que extract-contacts.js: los nombres reales de campo
+// vienen con prefijo/sufijo de sync con Salesforce (PersonEmail, DNI__c,
+// Otro_documento__c), no solo "Email"/"DNI" a secas, por eso se busca la
+// palabra en cualquier parte del nombre.
+const NON_IDENTIFIER_TYPES = /^(boolean|date|decimal|number)$/i;
+const NOT_AN_IDENTIFIER_NAME = /^tipo|tipo.?doc|tipo.?dni|bounce|reason|optout|prefer|consent|unsub|score/i;
+
+export async function getIdFields(customerKey) {
   const results = await soapRetrieveAll(
     'DataExtensionField',
-    ['Name', 'IsPrimaryKey'],
+    ['Name', 'FieldType'],
     { property: 'DataExtension.CustomerKey', value: customerKey }
   );
   const fields = (Array.isArray(results) ? results : [results]).filter(Boolean);
-  return fields.filter((f) => f.IsPrimaryKey === 'true').map((f) => f.Name);
+  const idFields = [];
+  for (const f of fields) {
+    const name = f.Name;
+    if (NON_IDENTIFIER_TYPES.test(f.FieldType)) continue;
+    if (NOT_AN_IDENTIFIER_NAME.test(name)) continue;
+    // SubscriberKey/ContactKey: en esta cuenta a veces guarda el DNI, a
+    // veces el email — pero sea lo que sea, es EL identificador real de
+    // SFMC, así que su valor se usa tal cual, sin resolver nada más.
+    if (/subscriber.?key|contact.?key/i.test(name)) idFields.push({ name, type: 'subscriberkey' });
+    else if (/email|correo|^mail$/i.test(name)) idFields.push({ name, type: 'email' });
+  }
+  return idFields;
 }
 
-// Trae la página 1 del rowset. Siempre página 1 a propósito: como cada
-// tanda borra lo que trajo, la "próxima" fila 1 pasa a ser la que antes
-// era la 501 — no hace falta llevar offset.
-export async function fetchFirstPage(customerKey, pkFields) {
+// Trae una página del rowset con sus campos identificadores (no solo la
+// clave primaria de la DE), para poder resolver el SubscriberKey real de
+// cada fila más adelante.
+export async function fetchPage(customerKey, page, idFields) {
   const token = await getToken();
-  const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(customerKey)}/rowset?$pageSize=${PAGE_SIZE}&$page=1`;
+  const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(customerKey)}/rowset?$pageSize=${PAGE_SIZE}&$page=${page}`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Rowset falló (${res.status})`);
   const data = await res.json();
   const items = data.items || [];
-  return items.map((item) => {
+  const rows = items.map((item) => {
     const flat = { ...(item.keys || {}), ...(item.values || {}) };
     const flatLower = {};
     for (const k in flat) flatLower[k.toLowerCase()] = flat[k];
-    const key = {};
-    for (const pk of pkFields) {
-      key[pk] = flat[pk] !== undefined ? flat[pk] : flatLower[pk.toLowerCase()];
+    const row = {};
+    for (const f of idFields) {
+      row[f.name] = flat[f.name] !== undefined ? flat[f.name] : flatLower[f.name.toLowerCase()];
     }
-    return key;
+    return row;
   });
+  return { rows, hasMore: items.length === PAGE_SIZE };
 }
 
-// Borra por lotes de hasta 500 (mismo tamaño que la página que se lee, así
-// nunca queda un resto sin borrar de la tanda leída).
-export async function deleteRows(customerKey, pkFields, rowKeys) {
-  if (rowKeys.length === 0) return;
-  const objectsXml = rowKeys
-    .map((row) => {
-      const propsXml = pkFields
-        .map((pk) => `<Property><Name>${escapeXml(pk)}</Name><Value>${escapeXml(String(row[pk] ?? ''))}</Value></Property>`)
-        .join('');
-      return `<Objects xsi:type="DataExtensionObject" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-        <CustomerKey>${escapeXml(customerKey)}</CustomerKey>
-        <Properties>${propsXml}</Properties>
-      </Objects>`;
-    })
-    .join('');
-  const requestXml = `<DeleteRequest xmlns="http://exacttarget.com/wsdl/partnerAPI">${objectsXml}</DeleteRequest>`;
-  const body = await soapRequest(requestXml);
-  const resp = body.DeleteResponse;
-  const overallStatus = resp?.OverallStatus;
-  if (overallStatus && overallStatus !== 'OK') {
-    // No se aborta: SFMC puede reportar fallas parciales fila por fila
-    // (ej. una ya borrada por otro proceso). Se devuelve para que la UI
-    // lo muestre en vez de esconderlo.
-    return { overallStatus, raw: resp };
-  }
-  return { overallStatus: overallStatus || 'OK' };
+// Resuelve un lote de emails a su SubscriberKey real vía el objeto
+// Subscriber (el de la DE puede no coincidir: la clave primaria de la DE
+// no es necesariamente la Clave del Suscriptor de la cuenta). Se hace de a
+// una consulta por email porque el filtro SOAP simple no admite listas.
+export async function resolveSubscriberKeyByEmail(email) {
+  const results = await soapRetrieveAll('Subscriber', ['SubscriberKey', 'EmailAddress'], {
+    property: 'EmailAddress',
+    value: email,
+  });
+  const row = Array.isArray(results) ? results[0] : results;
+  return row?.SubscriberKey || null;
 }
 
-function escapeXml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// Borrado global asíncrono del Contact/Subscriber dueño de cada
+// SubscriberKey — no borra filas de una DE puntual, borra al contacto de
+// toda la cuenta (todas las BUs, todas las DEs, historial de envíos).
+// SFMC encola el pedido y lo procesa en horas; devuelve un OperationID
+// para consultar el estado después.
+export async function submitContactDelete(subscriberKeys) {
+  if (subscriberKeys.length === 0) return null;
+  const token = await getToken();
+  const res = await fetch(`${REST_BASE}/contacts/v1/contacts/actions/delete?type=keys`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ContactTypeId: 0,
+      values: subscriberKeys,
+      DeleteOperationType: 'ContactAndAttributes',
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Contact Delete falló (${res.status}): ${text}`);
+  const data = JSON.parse(text);
+  return data.OperationID || data.operationId || data.requestId || null;
+}
+
+export async function getContactDeleteStatus(operationId) {
+  const token = await getToken();
+  const url = `${REST_BASE}/contacts/v1/contacts/actions/delete/status?operationID=${encodeURIComponent(operationId)}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Consulta de estado falló (${res.status}): ${text}`);
+  return JSON.parse(text);
 }

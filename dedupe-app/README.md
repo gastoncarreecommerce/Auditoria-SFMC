@@ -1,26 +1,53 @@
-# SFMC — Vaciar Data Extensions
+# SFMC — Borrar contactos globales a partir de una Data Extension
 
 Herramienta interna: elegís una Data Extension, confirmás escribiendo su
-nombre exacto, y borrás sus filas de a tandas (hasta 500 por click) hasta
-dejarla vacía. La DE en sí no se borra, solo sus filas.
+nombre exacto, y la app escanea sus filas para resolver el **SubscriberKey**
+real de cada una en SFMC. Con esos SubscriberKeys mandás una solicitud de
+**borrado global del Contact/Subscriber** — no borra filas de esa DE
+puntual, borra al contacto entero de toda la cuenta: todas las BUs, todas
+las Data Extensions donde aparezca, y su historial de envíos.
 
-## Cómo funciona el borrado
+## Cómo funciona
 
-SFMC no tiene un endpoint de "vaciar toda la DE" — hay que borrar fila por
-fila identificándola por su clave primaria. Esta app:
+SFMC expone dos borrados distintos y esta herramienta usa el segundo:
 
-1. Trae la página 1 del rowset de la DE (hasta 500 filas).
-2. Las borra por SOAP usando su(s) campo(s) de clave primaria real (no los
-   que la auditoría detecta como "parece DNI/email" — la clave primaria de
-   verdad, la que exige SFMC).
-3. Repite: como cada tanda borra lo que trajo, la "próxima página 1"
-   siempre son filas todavía no tocadas. No hace falta llevar offset.
+- Borrar filas de una DE puntual (SOAP `DeleteRequest`) — la DE queda
+  vacía, pero el contacto sigue existiendo en el resto de la cuenta.
+- Borrar el Contact/Subscriber global (`POST /contacts/v1/contacts/actions/delete?type=keys`)
+  — esto es lo que hace esta app.
 
-Cada tanda es una llamada HTTP separada, disparada por el botón (o por el
-modo "seguir automáticamente", que simplemente sigue apretando el mismo
-botón solo, con un respiro de 400ms entre tandas). Así una DE de millones
-de filas no depende de que una sola función serverless aguante horas
-corriendo — cosa que Vercel no permite.
+Pasos:
+
+1. **Escaneo**: recorre el rowset de la DE elegida, página por página. Por
+   cada fila:
+   - si la DE tiene un campo `SubscriberKey`/`ContactKey`, se usa ese valor
+     tal cual (es el identificador real de SFMC, sea lo que sea que guarde
+     en esta cuenta — en algunas DEs es el DNI, en otras el email).
+   - si no, y hay un campo de email, se resuelve el SubscriberKey real
+     consultando el objeto `Subscriber` de SFMC por ese email (porque la
+     clave primaria de la DE no necesariamente coincide con la Clave del
+     Suscriptor de la cuenta).
+   - si no hay ninguno de los dos, esa fila queda sin resolver y se cuenta
+     aparte — nunca se inventa un identificador.
+2. **Envío**: una vez terminado el escaneo, se manda la solicitud de
+   borrado global en tandas de hasta 500 SubscriberKeys. SFMC la encola —
+   el procesamiento real puede tardar horas — y devuelve un `OperationID`
+   por tanda.
+3. **Estado**: con cada `OperationID` podés consultar el estado del
+   borrado (`/contacts/v1/contacts/actions/delete/status`) cuando quieras,
+   sin tener que quedarte esperando en la página.
+
+## ⚠️ Sin verificar contra la cuenta real
+
+A diferencia del resto del proyecto de auditoría (todo probado contra
+respuestas reales de SFMC antes de confiarlo a escala), esta llamada de
+borrado global no se probó todavía contra la cuenta — no hay endpoint de
+sandbox para esto. El esquema del request (`ContactTypeId`, `values`,
+`DeleteOperationType`) está tomado de la documentación oficial de
+Salesforce, pero la primera tanda real que mandes es también la primera
+prueba end-to-end. Recomendado: la primera vez, mandá una tanda chica
+(o de una DE de bajo riesgo) y confirmá en SFMC que el contacto
+efectivamente se borró antes de tandas grandes.
 
 ## Deploy en Vercel
 
@@ -29,8 +56,9 @@ corriendo — cosa que Vercel no permite.
    elegí `dedupe-app`.
 2. Framework Preset: Next.js (debería detectarlo solo).
 3. Cargá las variables de entorno de `.env.example` en Project Settings →
-   Environment Variables (las mismas credenciales de SFMC que usa el resto
-   del repo, más `APP_PASSWORD` con una contraseña propia).
+   Environment Variables (credenciales de un paquete de SFMC con permiso
+   de **Contacts: Read and Write** además de Data Extensions, más
+   `APP_PASSWORD` con una contraseña propia).
 4. Deploy. Cada push a la rama conectada vuelve a desplegar solo.
 
 ## Correr en local
@@ -51,4 +79,6 @@ npm run dev
   `customerKey` mal armado no pasa la confirmación aunque el nombre en
   pantalla sea el correcto.
 - Las DEs de sistema de SFMC (`_Subscribers`, `_Sent`, etc.) están excluidas
-  tanto del listado como, por las dudas, del propio endpoint de borrado.
+  tanto del listado como, por las dudas, del propio endpoint de escaneo.
+- Una fila sin `SubscriberKey`/`ContactKey` ni email detectable nunca se
+  "adivina" — queda contada como sin resolver y no se manda a borrar.

@@ -1,5 +1,7 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
+
+const SUBMIT_CHUNK = 500;
 
 export default function Home() {
   const [des, setDes] = useState([]);
@@ -7,13 +9,18 @@ export default function Home() {
   const [loadError, setLoadError] = useState('');
   const [selectedKey, setSelectedKey] = useState('');
   const [confirmText, setConfirmText] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [autoContinue, setAutoContinue] = useState(false);
-  const [totalDeleted, setTotalDeleted] = useState(0);
-  const [done, setDone] = useState(false);
-  const [log, setLog] = useState([]);
-  const [errorMsg, setErrorMsg] = useState('');
-  const stopRef = useRef(false); // para poder cortar un auto-continuar en curso
+
+  const [scanning, setScanning] = useState(false);
+  const [page, setPage] = useState(1);
+  const [scanDone, setScanDone] = useState(false);
+  const [subscriberKeys, setSubscriberKeys] = useState([]);
+  const [unresolvedCount, setUnresolvedCount] = useState(0);
+  const [scanLog, setScanLog] = useState([]);
+  const [scanError, setScanError] = useState('');
+  const stopRef = useRef(false);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [operations, setOperations] = useState([]); // {id, submitted, status, checking}
 
   useEffect(() => {
     fetch('/api/data-extensions')
@@ -27,55 +34,123 @@ export default function Home() {
   }, []);
 
   const selected = des.find((d) => d.customerKey === selectedKey);
-  const canDelete = selected && confirmText.trim() === selected.name && !busy && !done;
+  const canScan = selected && confirmText.trim() === selected.name && !scanning;
 
   function selectDe(key) {
     setSelectedKey(key);
     setConfirmText('');
-    setTotalDeleted(0);
-    setDone(false);
-    setLog([]);
-    setErrorMsg('');
+    resetScan();
+  }
+
+  function resetScan() {
+    setPage(1);
+    setScanDone(false);
+    setSubscriberKeys([]);
+    setUnresolvedCount(0);
+    setScanLog([]);
+    setScanError('');
+    setOperations([]);
     stopRef.current = false;
   }
 
-  async function deleteBatch() {
+  async function scanNextPage(currentPage) {
     if (!selected) return;
-    setBusy(true);
-    setErrorMsg('');
+    setScanning(true);
+    setScanError('');
     try {
-      const res = await fetch('/api/delete-batch', {
+      const res = await fetch('/api/scan-batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customerKey: selected.customerKey, confirmName: confirmText.trim() }),
+        body: JSON.stringify({ customerKey: selected.customerKey, confirmName: confirmText.trim(), page: currentPage }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
 
-      setTotalDeleted((n) => n + data.deleted);
-      setLog((l) => [...l, { at: new Date().toLocaleTimeString(), deleted: data.deleted, done: data.done }].slice(-50));
+      setSubscriberKeys((prev) => prev.concat(data.subscriberKeys));
+      setUnresolvedCount((n) => n + data.unresolved);
+      setScanLog((l) =>
+        [
+          ...l,
+          {
+            at: new Date().toLocaleTimeString(),
+            page: currentPage,
+            resolved: data.subscriberKeys.length,
+            unresolved: data.unresolved,
+          },
+        ].slice(-100)
+      );
 
-      if (data.done) {
-        setDone(true);
-        setBusy(false);
+      if (!data.hasMore) {
+        setScanDone(true);
+        setScanning(false);
         return;
       }
 
-      if (autoContinue && !stopRef.current) {
-        setTimeout(() => deleteBatch(), 400);
+      const nextPage = currentPage + 1;
+      setPage(nextPage);
+      if (!stopRef.current) {
+        setTimeout(() => scanNextPage(nextPage), 200);
       } else {
-        setBusy(false);
+        setScanning(false);
       }
     } catch (err) {
-      setErrorMsg(err.message);
-      setBusy(false);
+      setScanError(err.message);
+      setScanning(false);
       stopRef.current = true;
     }
   }
 
-  function stopAuto() {
+  function startScan() {
+    resetScan();
+    stopRef.current = false;
+    setTimeout(() => scanNextPage(1), 0);
+  }
+
+  function stopScan() {
     stopRef.current = true;
-    setAutoContinue(false);
+  }
+
+  async function submitAll() {
+    setSubmitting(true);
+    const chunks = [];
+    for (let i = 0; i < subscriberKeys.length; i += SUBMIT_CHUNK) {
+      chunks.push(subscriberKeys.slice(i, i + SUBMIT_CHUNK));
+    }
+    const newOps = [];
+    for (const chunk of chunks) {
+      try {
+        const res = await fetch('/api/submit-delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ subscriberKeys: chunk }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Error desconocido');
+        newOps.push({ id: data.operationId, submitted: data.submitted, status: null, error: null });
+      } catch (err) {
+        newOps.push({ id: null, submitted: chunk.length, status: null, error: err.message });
+      }
+      setOperations((prev) => [...prev, newOps[newOps.length - 1]]);
+    }
+    setSubmitting(false);
+  }
+
+  async function checkStatus(opId) {
+    setOperations((prev) => prev.map((o) => (o.id === opId ? { ...o, checking: true } : o)));
+    try {
+      const res = await fetch('/api/delete-status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operationId: opId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error desconocido');
+      setOperations((prev) =>
+        prev.map((o) => (o.id === opId ? { ...o, status: data.status, checking: false } : o))
+      );
+    } catch (err) {
+      setOperations((prev) => prev.map((o) => (o.id === opId ? { ...o, error: err.message, checking: false } : o)));
+    }
   }
 
   async function logout() {
@@ -84,17 +159,19 @@ export default function Home() {
   }
 
   return (
-    <div style={{ maxWidth: 720, margin: '0 auto', padding: '32px 20px' }}>
+    <div style={{ maxWidth: 760, margin: '0 auto', padding: '32px 20px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h1 style={{ fontSize: 20 }}>SFMC — Vaciar Data Extension</h1>
+        <h1 style={{ fontSize: 20 }}>SFMC — Borrar contactos por Data Extension</h1>
         <button onClick={logout} style={linkBtn}>
           Salir
         </button>
       </div>
 
       <p style={{ color: '#999', fontSize: 14, lineHeight: 1.5 }}>
-        Elegí una DE, escribí su nombre exacto para confirmar, y borrá de a tandas de hasta 500 filas. Esto borra las
-        filas de adentro de la DE — la DE en sí sigue existiendo, vacía.
+        Elegí una DE, escribí su nombre exacto para confirmar, y escaneá sus filas: por cada una se resuelve el
+        SubscriberKey real del contacto en SFMC. Al final mandás UNA solicitud de borrado global — borra al{' '}
+        <strong>contacto entero</strong> (todas las BUs, todas las DEs, historial de envíos), no solo esta DE. SFMC la
+        procesa en cola y puede tardar horas; podés consultar el estado con el OperationID.
       </p>
 
       {loadingDes && <p>Cargando Data Extensions...</p>}
@@ -102,11 +179,7 @@ export default function Home() {
 
       {!loadingDes && !loadError && (
         <>
-          <select
-            value={selectedKey}
-            onChange={(e) => selectDe(e.target.value)}
-            style={selectStyle}
-          >
+          <select value={selectedKey} onChange={(e) => selectDe(e.target.value)} style={selectStyle}>
             <option value="">— Elegí una Data Extension —</option>
             {des.map((d) => (
               <option key={d.customerKey} value={d.customerKey}>
@@ -118,57 +191,100 @@ export default function Home() {
           {selected && (
             <div style={{ marginTop: 20, padding: 20, background: '#1a1d24', borderRadius: 12 }}>
               <p style={{ margin: 0, fontSize: 14 }}>
-                Vas a vaciar: <strong>{selected.name}</strong>
+                DE elegida: <strong>{selected.name}</strong>
               </p>
               <p style={{ color: '#ffb020', fontSize: 13 }}>
-                ⚠️ Esto es irreversible. Escribí el nombre exacto de la DE para habilitar el borrado.
+                ⚠️ Esto borra contactos de SFMC de forma global e irreversible. Escribí el nombre exacto de la DE para
+                habilitar el escaneo.
               </p>
               <input
                 type="text"
                 placeholder="Nombre exacto de la DE"
                 value={confirmText}
                 onChange={(e) => setConfirmText(e.target.value)}
-                disabled={busy || done}
+                disabled={scanning}
                 style={inputStyle}
               />
 
               <div style={{ display: 'flex', gap: 10, marginTop: 14, alignItems: 'center' }}>
-                <button onClick={deleteBatch} disabled={!canDelete} style={dangerBtn(canDelete)}>
-                  {busy ? 'Borrando...' : 'Borrar siguiente tanda (≤500)'}
+                <button onClick={startScan} disabled={!canScan} style={dangerBtn(canScan)}>
+                  {scanning ? `Escaneando página ${page}...` : 'Escanear DE'}
                 </button>
-                <label style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <input
-                    type="checkbox"
-                    checked={autoContinue}
-                    onChange={(e) => setAutoContinue(e.target.checked)}
-                    disabled={busy || done}
-                  />
-                  seguir automáticamente
-                </label>
-                {busy && autoContinue && (
-                  <button onClick={stopAuto} style={linkBtn}>
+                {scanning && (
+                  <button onClick={stopScan} style={linkBtn}>
                     Frenar
                   </button>
                 )}
               </div>
 
-              {errorMsg && <p style={{ color: '#ff6b6b', marginTop: 12 }}>Error: {errorMsg}</p>}
-              {done && <p style={{ color: '#4ade80', marginTop: 12 }}>✓ Listo — la DE quedó sin filas.</p>}
+              {scanError && <p style={{ color: '#ff6b6b', marginTop: 12 }}>Error: {scanError}</p>}
 
-              <p style={{ marginTop: 16, fontSize: 14 }}>
-                Total borrado en esta sesión: <strong>{totalDeleted.toLocaleString('es-AR')}</strong>
-              </p>
+              {(subscriberKeys.length > 0 || unresolvedCount > 0) && (
+                <p style={{ marginTop: 16, fontSize: 14 }}>
+                  Resueltos: <strong>{subscriberKeys.length.toLocaleString('es-AR')}</strong> contactos
+                  {unresolvedCount > 0 && (
+                    <>
+                      {' '}
+                      — sin resolver: <strong style={{ color: '#ffb020' }}>{unresolvedCount.toLocaleString('es-AR')}</strong>
+                    </>
+                  )}
+                  {scanDone && <span style={{ color: '#4ade80' }}> — escaneo completo</span>}
+                </p>
+              )}
 
-              {log.length > 0 && (
-                <div style={{ marginTop: 12, maxHeight: 200, overflowY: 'auto', fontSize: 12, color: '#999' }}>
-                  {log
+              {scanLog.length > 0 && (
+                <div style={{ marginTop: 8, maxHeight: 160, overflowY: 'auto', fontSize: 12, color: '#999' }}>
+                  {scanLog
                     .slice()
                     .reverse()
                     .map((l, i) => (
                       <div key={i}>
-                        {l.at} — {l.deleted} borradas {l.done ? '(DE vacía)' : ''}
+                        {l.at} — página {l.page}: {l.resolved} resueltos, {l.unresolved} sin resolver
                       </div>
                     ))}
+                </div>
+              )}
+
+              {scanDone && subscriberKeys.length > 0 && (
+                <div style={{ marginTop: 20, borderTop: '1px solid #333', paddingTop: 16 }}>
+                  <p style={{ fontSize: 13, color: '#ffb020' }}>
+                    Vas a mandar el borrado global de {subscriberKeys.length.toLocaleString('es-AR')} contactos, en{' '}
+                    {Math.ceil(subscriberKeys.length / SUBMIT_CHUNK)} solicitud(es) de hasta {SUBMIT_CHUNK} cada una.
+                  </p>
+                  <button
+                    onClick={submitAll}
+                    disabled={submitting || operations.length > 0}
+                    style={dangerBtn(!submitting && operations.length === 0)}
+                  >
+                    {submitting ? 'Enviando...' : 'Enviar solicitud de borrado global'}
+                  </button>
+                </div>
+              )}
+
+              {operations.length > 0 && (
+                <div style={{ marginTop: 16 }}>
+                  <p style={{ fontSize: 13, color: '#999' }}>Solicitudes enviadas:</p>
+                  {operations.map((op, i) => (
+                    <div key={i} style={{ fontSize: 12, marginBottom: 8, padding: 8, background: '#0f1115', borderRadius: 6 }}>
+                      {op.error ? (
+                        <span style={{ color: '#ff6b6b' }}>
+                          Tanda de {op.submitted}: error — {op.error}
+                        </span>
+                      ) : (
+                        <>
+                          OperationID <strong>{op.id}</strong> ({op.submitted} contactos){' '}
+                          <button onClick={() => checkStatus(op.id)} style={linkBtn} disabled={op.checking}>
+                            {op.checking ? 'consultando...' : 'consultar estado'}
+                          </button>
+                          {op.status && (
+                            <pre style={{ whiteSpace: 'pre-wrap', color: '#999', marginTop: 4 }}>
+                              {JSON.stringify(op.status, null, 2)}
+                            </pre>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
