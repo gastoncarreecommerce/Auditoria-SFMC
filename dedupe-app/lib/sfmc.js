@@ -5,7 +5,30 @@ const { SFMC_CLIENT_ID, SFMC_CLIENT_SECRET, SFMC_SUBDOMAIN, SFMC_PARENT_ACCOUNT_
 const AUTH_URL = `https://${SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`;
 const SOAP_URL = `https://${SFMC_SUBDOMAIN}.soap.marketingcloudapis.com/Service.asmx`;
 const REST_BASE = `https://${SFMC_SUBDOMAIN}.rest.marketingcloudapis.com`;
-const PAGE_SIZE = 500; // tanda chica a propósito: cada llamada borra como mucho esto
+const PAGE_SIZE = 500; // tamaño de tanda para el envío de borrado (values por request)
+// Tamaño de página al ESCANEAR una DE: mucho más chico que PAGE_SIZE a
+// propósito. Cada fila sin campo SubscriberKey propio dispara un lookup
+// SOAP por email, y con 500 filas por página esos lookups (aunque
+// paralelizados) pueden superar el límite de tiempo de la función
+// serverless — la función corta y Vercel devuelve una página de error en
+// HTML en vez de JSON, que rompía el parseo en el cliente.
+const SCAN_PAGE_SIZE = 50;
+// Cuántos lookups de Subscriber por email se hacen en paralelo dentro de
+// una misma página escaneada.
+const LOOKUP_CONCURRENCY = 8;
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
 
@@ -151,7 +174,7 @@ export async function getIdFields(customerKey) {
 // cada fila más adelante.
 export async function fetchPage(customerKey, page, idFields) {
   const token = await getToken();
-  const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(customerKey)}/rowset?$pageSize=${PAGE_SIZE}&$page=${page}`;
+  const url = `${REST_BASE}/data/v1/customobjectdata/key/${encodeURIComponent(customerKey)}/rowset?$pageSize=${SCAN_PAGE_SIZE}&$page=${page}`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Rowset falló (${res.status})`);
   const data = await res.json();
@@ -166,13 +189,18 @@ export async function fetchPage(customerKey, page, idFields) {
     }
     return row;
   });
-  return { rows, hasMore: items.length === PAGE_SIZE };
+  // El rowset trae la cantidad total de filas de la DE (si la API la
+  // expone) — sirve para mostrar un progreso real en vez de solo "página N".
+  const totalRows = typeof data.count === 'number' ? data.count : null;
+  return { rows, hasMore: items.length === SCAN_PAGE_SIZE, totalRows };
 }
 
-// Resuelve un lote de emails a su SubscriberKey real vía el objeto
-// Subscriber (el de la DE puede no coincidir: la clave primaria de la DE
-// no es necesariamente la Clave del Suscriptor de la cuenta). Se hace de a
-// una consulta por email porque el filtro SOAP simple no admite listas.
+// Resuelve un email a su SubscriberKey real vía el objeto Subscriber (el
+// de la DE puede no coincidir: la clave primaria de la DE no es
+// necesariamente la Clave del Suscriptor de la cuenta). Se hace de a una
+// consulta por email porque el filtro SOAP simple no admite listas — pero
+// varias en paralelo por página (ver mapWithConcurrency) para no comerse
+// el límite de tiempo de la función serverless.
 export async function resolveSubscriberKeyByEmail(email) {
   const results = await soapRetrieveAll('Subscriber', ['SubscriberKey', 'EmailAddress'], {
     property: 'EmailAddress',
@@ -180,6 +208,10 @@ export async function resolveSubscriberKeyByEmail(email) {
   });
   const row = Array.isArray(results) ? results[0] : results;
   return row?.SubscriberKey || null;
+}
+
+export async function resolveSubscriberKeysByEmail(emails) {
+  return mapWithConcurrency(emails, LOOKUP_CONCURRENCY, (email) => resolveSubscriberKeyByEmail(email));
 }
 
 // Borrado global asíncrono del Contact/Subscriber dueño de cada
