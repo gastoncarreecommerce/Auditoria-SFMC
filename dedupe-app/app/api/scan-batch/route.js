@@ -4,7 +4,7 @@ import {
   isSystemDE,
   getIdFields,
   fetchPage,
-  resolveSubscriberKeyByEmail,
+  resolveSubscriberKeysByEmail,
 } from '../../../lib/sfmc';
 
 export const runtime = 'nodejs';
@@ -41,33 +41,51 @@ export async function POST(request) {
       );
     }
 
-    const { rows, hasMore } = await fetchPage(customerKey, page, idFields);
+    const { rows, hasMore, totalRows } = await fetchPage(customerKey, page, idFields);
 
-    const subscriberKeys = [];
-    let unresolved = 0;
+    // Primero se separan las filas que ya traen SubscriberKey directo de
+    // las que necesitan resolverse por email, así el lookup por email
+    // (el que puede tardar) se manda todo junto en paralelo en vez de
+    // intercalado fila por fila.
+    const direct = []; // { identifier, subscriberKey }
+    const needsLookup = []; // { identifier }
     for (const row of rows) {
-      let key = null;
+      let directKey = null;
       for (const f of idFields) {
         if (f.type === 'subscriberkey' && row[f.name]) {
-          key = row[f.name];
+          directKey = row[f.name];
           break;
         }
       }
-      if (!key) {
-        const emailField = idFields.find((f) => f.type === 'email' && row[f.name]);
-        if (emailField) key = await resolveSubscriberKeyByEmail(row[emailField.name]);
+      if (directKey) {
+        direct.push({ identifier: directKey, subscriberKey: directKey });
+        continue;
       }
-      if (key) subscriberKeys.push(key);
-      else unresolved++;
+      const emailField = idFields.find((f) => f.type === 'email' && row[f.name]);
+      if (emailField) needsLookup.push({ identifier: row[emailField.name] });
+      else needsLookup.push({ identifier: null });
     }
+
+    const emailsToResolve = needsLookup.filter((r) => r.identifier).map((r) => r.identifier);
+    const resolvedKeys = await resolveSubscriberKeysByEmail(emailsToResolve);
+    let resolvedIdx = 0;
+    const lookedUp = needsLookup.map((r) => {
+      if (!r.identifier) return { identifier: null, subscriberKey: null };
+      return { identifier: r.identifier, subscriberKey: resolvedKeys[resolvedIdx++] };
+    });
+
+    const resolved = [...direct, ...lookedUp].filter((r) => r.subscriberKey);
+    const unresolved = [...direct, ...lookedUp].filter((r) => !r.subscriberKey);
 
     return NextResponse.json({
       deName: realName,
       page,
       rowsInPage: rows.length,
       hasMore,
-      subscriberKeys,
-      unresolved,
+      totalRows,
+      resolved, // [{ identifier, subscriberKey }]
+      unresolvedCount: unresolved.length,
+      unresolvedIdentifiers: unresolved.map((r) => r.identifier).filter(Boolean),
     });
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });

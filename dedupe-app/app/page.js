@@ -3,6 +3,36 @@ import { useRef, useState, useEffect } from 'react';
 
 const SUBMIT_CHUNK = 500;
 
+// El servidor puede caerse (timeout, crash) y devolver una página de error
+// en HTML en vez de JSON — sin esto, res.json() explota con un mensaje
+// confuso tipo "Unexpected token 'A' is not valid JSON".
+async function safeJson(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      `El servidor no devolvió una respuesta válida (status ${res.status}). Puede ser un timeout — probá de nuevo. Detalle: ${text.slice(0, 200)}`
+    );
+  }
+}
+
+function toCsv(rows) {
+  const header = 'identifier,subscriberKey\n';
+  const body = rows.map((r) => `"${String(r.identifier).replace(/"/g, '""')}","${String(r.subscriberKey).replace(/"/g, '""')}"`).join('\n');
+  return header + body;
+}
+
+function downloadCsv(filename, csvText) {
+  const blob = new Blob(['﻿' + csvText], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function Home() {
   const [des, setDes] = useState([]);
   const [loadingDes, setLoadingDes] = useState(true);
@@ -13,8 +43,10 @@ export default function Home() {
   const [scanning, setScanning] = useState(false);
   const [page, setPage] = useState(1);
   const [scanDone, setScanDone] = useState(false);
-  const [subscriberKeys, setSubscriberKeys] = useState([]);
-  const [unresolvedCount, setUnresolvedCount] = useState(0);
+  const [totalRows, setTotalRows] = useState(null);
+  const [rowsScanned, setRowsScanned] = useState(0);
+  const [resolvedRows, setResolvedRows] = useState([]); // [{identifier, subscriberKey}]
+  const [unresolvedIdentifiers, setUnresolvedIdentifiers] = useState([]);
   const [scanLog, setScanLog] = useState([]);
   const [scanError, setScanError] = useState('');
   const stopRef = useRef(false);
@@ -35,6 +67,7 @@ export default function Home() {
 
   const selected = des.find((d) => d.customerKey === selectedKey);
   const canScan = selected && confirmText.trim() === selected.name && !scanning;
+  const progressPct = totalRows ? Math.min(100, Math.round((rowsScanned / totalRows) * 100)) : null;
 
   function selectDe(key) {
     setSelectedKey(key);
@@ -45,8 +78,10 @@ export default function Home() {
   function resetScan() {
     setPage(1);
     setScanDone(false);
-    setSubscriberKeys([]);
-    setUnresolvedCount(0);
+    setTotalRows(null);
+    setRowsScanned(0);
+    setResolvedRows([]);
+    setUnresolvedIdentifiers([]);
     setScanLog([]);
     setScanError('');
     setOperations([]);
@@ -63,21 +98,23 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ customerKey: selected.customerKey, confirmName: confirmText.trim(), page: currentPage }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
 
-      setSubscriberKeys((prev) => prev.concat(data.subscriberKeys));
-      setUnresolvedCount((n) => n + data.unresolved);
+      setResolvedRows((prev) => prev.concat(data.resolved));
+      setUnresolvedIdentifiers((prev) => prev.concat(data.unresolvedIdentifiers));
+      setRowsScanned((n) => n + data.rowsInPage);
+      if (data.totalRows != null) setTotalRows(data.totalRows);
       setScanLog((l) =>
         [
           ...l,
           {
             at: new Date().toLocaleTimeString(),
             page: currentPage,
-            resolved: data.subscriberKeys.length,
-            unresolved: data.unresolved,
+            resolved: data.resolved.length,
+            unresolved: data.unresolvedCount,
           },
-        ].slice(-100)
+        ].slice(-200)
       );
 
       if (!data.hasMore) {
@@ -89,7 +126,7 @@ export default function Home() {
       const nextPage = currentPage + 1;
       setPage(nextPage);
       if (!stopRef.current) {
-        setTimeout(() => scanNextPage(nextPage), 200);
+        setTimeout(() => scanNextPage(nextPage), 150);
       } else {
         setScanning(false);
       }
@@ -110,27 +147,39 @@ export default function Home() {
     stopRef.current = true;
   }
 
+  function downloadResolvedCsv() {
+    const safeName = (selected?.name || 'de').replace(/[^a-z0-9_-]+/gi, '_');
+    downloadCsv(`${safeName}_contactos_a_borrar.csv`, toCsv(resolvedRows));
+  }
+
+  function downloadUnresolvedCsv() {
+    const safeName = (selected?.name || 'de').replace(/[^a-z0-9_-]+/gi, '_');
+    const csv = 'identifier_sin_resolver\n' + unresolvedIdentifiers.map((v) => `"${String(v).replace(/"/g, '""')}"`).join('\n');
+    downloadCsv(`${safeName}_sin_resolver.csv`, csv);
+  }
+
   async function submitAll() {
     setSubmitting(true);
+    const subscriberKeys = resolvedRows.map((r) => r.subscriberKey);
     const chunks = [];
     for (let i = 0; i < subscriberKeys.length; i += SUBMIT_CHUNK) {
       chunks.push(subscriberKeys.slice(i, i + SUBMIT_CHUNK));
     }
-    const newOps = [];
     for (const chunk of chunks) {
+      let op;
       try {
         const res = await fetch('/api/submit-delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ subscriberKeys: chunk }),
         });
-        const data = await res.json();
+        const data = await safeJson(res);
         if (!res.ok) throw new Error(data.error || 'Error desconocido');
-        newOps.push({ id: data.operationId, submitted: data.submitted, status: null, error: null });
+        op = { id: data.operationId, submitted: data.submitted, status: null, error: null };
       } catch (err) {
-        newOps.push({ id: null, submitted: chunk.length, status: null, error: err.message });
+        op = { id: null, submitted: chunk.length, status: null, error: err.message };
       }
-      setOperations((prev) => [...prev, newOps[newOps.length - 1]]);
+      setOperations((prev) => [...prev, op]);
     }
     setSubmitting(false);
   }
@@ -143,7 +192,7 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ operationId: opId }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
       setOperations((prev) =>
         prev.map((o) => (o.id === opId ? { ...o, status: data.status, checking: false } : o))
@@ -169,9 +218,9 @@ export default function Home() {
 
       <p style={{ color: '#999', fontSize: 14, lineHeight: 1.5 }}>
         Elegí una DE, escribí su nombre exacto para confirmar, y escaneá sus filas: por cada una se resuelve el
-        SubscriberKey real del contacto en SFMC. Al final mandás UNA solicitud de borrado global — borra al{' '}
-        <strong>contacto entero</strong> (todas las BUs, todas las DEs, historial de envíos), no solo esta DE. SFMC la
-        procesa en cola y puede tardar horas; podés consultar el estado con el OperationID.
+        SubscriberKey real del contacto en SFMC. Al final descargás el CSV y mandás UNA solicitud de borrado global
+        — borra al <strong>contacto entero</strong> (todas las BUs, todas las DEs, historial de envíos), no solo esta
+        DE. SFMC la procesa en cola y puede tardar horas; podés consultar el estado con el OperationID.
       </p>
 
       {loadingDes && <p>Cargando Data Extensions...</p>}
@@ -219,13 +268,37 @@ export default function Home() {
 
               {scanError && <p style={{ color: '#ff6b6b', marginTop: 12 }}>Error: {scanError}</p>}
 
-              {(subscriberKeys.length > 0 || unresolvedCount > 0) && (
-                <p style={{ marginTop: 16, fontSize: 14 }}>
-                  Resueltos: <strong>{subscriberKeys.length.toLocaleString('es-AR')}</strong> contactos
-                  {unresolvedCount > 0 && (
+              {(scanning || rowsScanned > 0) && (
+                <div style={{ marginTop: 16 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#999' }}>
+                    <span>
+                      {rowsScanned.toLocaleString('es-AR')}
+                      {totalRows != null ? ` / ${totalRows.toLocaleString('es-AR')}` : ''} filas escaneadas
+                    </span>
+                    {progressPct != null && <span>{progressPct}%</span>}
+                  </div>
+                  <div style={{ height: 8, background: '#0f1115', borderRadius: 4, marginTop: 4, overflow: 'hidden' }}>
+                    <div
+                      style={{
+                        height: '100%',
+                        width: progressPct != null ? `${progressPct}%` : scanning ? '100%' : '0%',
+                        background: scanDone ? '#4ade80' : '#dc2626',
+                        transition: 'width 0.2s',
+                        ...(progressPct == null && scanning ? { animation: 'pulse 1.2s infinite' } : {}),
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {(resolvedRows.length > 0 || unresolvedIdentifiers.length > 0) && (
+                <p style={{ marginTop: 12, fontSize: 14 }}>
+                  Resueltos: <strong>{resolvedRows.length.toLocaleString('es-AR')}</strong> contactos
+                  {unresolvedIdentifiers.length > 0 && (
                     <>
                       {' '}
-                      — sin resolver: <strong style={{ color: '#ffb020' }}>{unresolvedCount.toLocaleString('es-AR')}</strong>
+                      — sin resolver:{' '}
+                      <strong style={{ color: '#ffb020' }}>{unresolvedIdentifiers.length.toLocaleString('es-AR')}</strong>
                     </>
                   )}
                   {scanDone && <span style={{ color: '#4ade80' }}> — escaneo completo</span>}
@@ -245,11 +318,27 @@ export default function Home() {
                 </div>
               )}
 
-              {scanDone && subscriberKeys.length > 0 && (
+              {(resolvedRows.length > 0 || unresolvedIdentifiers.length > 0) && (
+                <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+                  {resolvedRows.length > 0 && (
+                    <button onClick={downloadResolvedCsv} style={linkBtn}>
+                      ⬇ Descargar CSV de contactos a borrar ({resolvedRows.length})
+                    </button>
+                  )}
+                  {unresolvedIdentifiers.length > 0 && (
+                    <button onClick={downloadUnresolvedCsv} style={linkBtn}>
+                      ⬇ Descargar CSV de filas sin resolver ({unresolvedIdentifiers.length})
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {scanDone && resolvedRows.length > 0 && (
                 <div style={{ marginTop: 20, borderTop: '1px solid #333', paddingTop: 16 }}>
                   <p style={{ fontSize: 13, color: '#ffb020' }}>
-                    Vas a mandar el borrado global de {subscriberKeys.length.toLocaleString('es-AR')} contactos, en{' '}
-                    {Math.ceil(subscriberKeys.length / SUBMIT_CHUNK)} solicitud(es) de hasta {SUBMIT_CHUNK} cada una.
+                    Vas a mandar el borrado global de {resolvedRows.length.toLocaleString('es-AR')} contactos, en{' '}
+                    {Math.ceil(resolvedRows.length / SUBMIT_CHUNK)} solicitud(es) de hasta {SUBMIT_CHUNK} cada una.
+                    Te recomendamos haber descargado el CSV arriba antes de continuar.
                   </p>
                   <button
                     onClick={submitAll}
