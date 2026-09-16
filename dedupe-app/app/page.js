@@ -50,6 +50,7 @@ export default function Home() {
   const [scanLog, setScanLog] = useState([]);
   const [scanError, setScanError] = useState('');
   const stopRef = useRef(false);
+  const idFieldsRef = useRef(null); // se cachea desde la página 1 para no repedirlo cada página
 
   const [submitting, setSubmitting] = useState(false);
   const [operations, setOperations] = useState([]); // {id, submitted, status, checking}
@@ -86,6 +87,7 @@ export default function Home() {
     setScanError('');
     setOperations([]);
     stopRef.current = false;
+    idFieldsRef.current = null;
   }
 
   async function scanNextPage(currentPage) {
@@ -96,10 +98,16 @@ export default function Home() {
       const res = await fetch('/api/scan-batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customerKey: selected.customerKey, confirmName: confirmText.trim(), page: currentPage }),
+        body: JSON.stringify({
+          customerKey: selected.customerKey,
+          confirmName: confirmText.trim(),
+          page: currentPage,
+          idFields: idFieldsRef.current,
+        }),
       });
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'Error desconocido');
+      if (!idFieldsRef.current && data.idFields) idFieldsRef.current = data.idFields;
 
       setResolvedRows((prev) => prev.concat(data.resolved));
       setUnresolvedIdentifiers((prev) => prev.concat(data.unresolvedIdentifiers));
@@ -126,7 +134,7 @@ export default function Home() {
       const nextPage = currentPage + 1;
       setPage(nextPage);
       if (!stopRef.current) {
-        setTimeout(() => scanNextPage(nextPage), 150);
+        setTimeout(() => scanNextPage(nextPage), 50);
       } else {
         setScanning(false);
       }

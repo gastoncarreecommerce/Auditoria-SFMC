@@ -6,16 +6,18 @@ const AUTH_URL = `https://${SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token
 const SOAP_URL = `https://${SFMC_SUBDOMAIN}.soap.marketingcloudapis.com/Service.asmx`;
 const REST_BASE = `https://${SFMC_SUBDOMAIN}.rest.marketingcloudapis.com`;
 const PAGE_SIZE = 500; // tamaño de tanda para el envío de borrado (values por request)
-// Tamaño de página al ESCANEAR una DE: mucho más chico que PAGE_SIZE a
-// propósito. Cada fila sin campo SubscriberKey propio dispara un lookup
-// SOAP por email, y con 500 filas por página esos lookups (aunque
-// paralelizados) pueden superar el límite de tiempo de la función
-// serverless — la función corta y Vercel devuelve una página de error en
-// HTML en vez de JSON, que rompía el parseo en el cliente.
-const SCAN_PAGE_SIZE = 50;
-// Cuántos lookups de Subscriber por email se hacen en paralelo dentro de
-// una misma página escaneada.
-const LOOKUP_CONCURRENCY = 8;
+// Tamaño de página al ESCANEAR una DE. Antes era 50 porque cada fila sin
+// SubscriberKey propio hacía un lookup SOAP por email UNO POR UNO — con
+// DEs de millones de filas eso era, literalmente, cuestión de días. Ahora
+// los lookups se agrupan (ver EMAIL_BATCH_SIZE) así una página de 500
+// filas sigue resolviéndose en unos pocos segundos.
+const SCAN_PAGE_SIZE = 500;
+// Cuántos emails entran en un solo Retrieve SOAP (filtro OR anidado) en
+// vez de una consulta por email — esto es lo que realmente acelera el
+// escaneo, no la paralelización sola.
+const EMAIL_BATCH_SIZE = 25;
+// Cuántos de esos lotes de 25 se mandan en paralelo.
+const LOOKUP_CONCURRENCY = 6;
 
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
@@ -95,19 +97,65 @@ async function soapRequest(bodyXml) {
   return body;
 }
 
+function escapeXml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function simpleFilterXml(property, value) {
+  return `<Filter xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="SimpleFilterPart">
+    <Property>${property}</Property>
+    <SimpleOperator>equals</SimpleOperator>
+    <Value>${escapeXml(value)}</Value>
+  </Filter>`;
+}
+
+// Arma un filtro OR anidado para traer N valores en UNA sola llamada SOAP
+// en vez de una llamada por valor — sin esto, resolver millones de filas
+// por email es completamente inviable en tiempo real.
+function orFilterXml(property, values) {
+  if (values.length === 1) return simpleFilterXml(property, values[0]);
+  const [first, ...rest] = values;
+  return `<Filter xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="ComplexFilterPart">
+    <LeftOperand xsi:type="SimpleFilterPart">
+      <Property>${property}</Property>
+      <SimpleOperator>equals</SimpleOperator>
+      <Value>${escapeXml(first)}</Value>
+    </LeftOperand>
+    <LogicalOperator>OR</LogicalOperator>
+    <RightOperand ${rest.length === 1 ? 'xsi:type="SimpleFilterPart"' : 'xsi:type="ComplexFilterPart"'}>
+      ${rest.length === 1
+        ? `<Property>${property}</Property><SimpleOperator>equals</SimpleOperator><Value>${escapeXml(rest[0])}</Value>`
+        : orFilterInnerXml(property, rest)}
+    </RightOperand>
+  </Filter>`;
+}
+
+// Igual que orFilterXml pero sin el <Filter> envolvente — para anidar
+// dentro de un <RightOperand xsi:type="ComplexFilterPart">.
+function orFilterInnerXml(property, values) {
+  const [first, ...rest] = values;
+  return `<LeftOperand xsi:type="SimpleFilterPart">
+      <Property>${property}</Property>
+      <SimpleOperator>equals</SimpleOperator>
+      <Value>${escapeXml(first)}</Value>
+    </LeftOperand>
+    <LogicalOperator>OR</LogicalOperator>
+    <RightOperand ${rest.length === 1 ? 'xsi:type="SimpleFilterPart"' : 'xsi:type="ComplexFilterPart"'}>
+      ${rest.length === 1
+        ? `<Property>${property}</Property><SimpleOperator>equals</SimpleOperator><Value>${escapeXml(rest[0])}</Value>`
+        : orFilterInnerXml(property, rest)}
+    </RightOperand>`;
+}
+
 async function soapRetrieveAll(objectType, properties, filter) {
   let all = [];
   let continueId = null;
   let more = true;
   while (more) {
     const propsXml = properties.map((p) => `<Properties>${p}</Properties>`).join('');
-    const filterXml = filter
-      ? `<Filter xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="SimpleFilterPart">
-           <Property>${filter.property}</Property>
-           <SimpleOperator>equals</SimpleOperator>
-           <Value>${filter.value}</Value>
-         </Filter>`
-      : '';
+    let filterXml = '';
+    if (filter && filter.raw) filterXml = filter.raw;
+    else if (filter) filterXml = simpleFilterXml(filter.property, filter.value);
     const requestXml = continueId
       ? `<ContinueRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI"><ContinueRequest>${continueId}</ContinueRequest></ContinueRequestMsg>`
       : `<RetrieveRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI">
@@ -195,23 +243,33 @@ export async function fetchPage(customerKey, page, idFields) {
   return { rows, hasMore: items.length === SCAN_PAGE_SIZE, totalRows };
 }
 
-// Resuelve un email a su SubscriberKey real vía el objeto Subscriber (el
-// de la DE puede no coincidir: la clave primaria de la DE no es
-// necesariamente la Clave del Suscriptor de la cuenta). Se hace de a una
-// consulta por email porque el filtro SOAP simple no admite listas — pero
-// varias en paralelo por página (ver mapWithConcurrency) para no comerse
-// el límite de tiempo de la función serverless.
-export async function resolveSubscriberKeyByEmail(email) {
-  const results = await soapRetrieveAll('Subscriber', ['SubscriberKey', 'EmailAddress'], {
-    property: 'EmailAddress',
-    value: email,
-  });
-  const row = Array.isArray(results) ? results[0] : results;
-  return row?.SubscriberKey || null;
-}
-
+// Resuelve muchos emails a su SubscriberKey real vía el objeto Subscriber
+// (el de la DE puede no coincidir: la clave primaria de la DE no es
+// necesariamente la Clave del Suscriptor de la cuenta). Agrupa hasta
+// EMAIL_BATCH_SIZE emails por llamada SOAP (filtro OR anidado) en vez de
+// una llamada por email — es la diferencia entre horas y días en una DE
+// grande. Devuelve un Map email(lowercase) -> SubscriberKey.
 export async function resolveSubscriberKeysByEmail(emails) {
-  return mapWithConcurrency(emails, LOOKUP_CONCURRENCY, (email) => resolveSubscriberKeyByEmail(email));
+  const unique = [...new Set(emails)];
+  if (unique.length === 0) return new Map();
+
+  const batches = [];
+  for (let i = 0; i < unique.length; i += EMAIL_BATCH_SIZE) {
+    batches.push(unique.slice(i, i + EMAIL_BATCH_SIZE));
+  }
+
+  const map = new Map();
+  await mapWithConcurrency(batches, LOOKUP_CONCURRENCY, async (batch) => {
+    const results = await soapRetrieveAll('Subscriber', ['SubscriberKey', 'EmailAddress'], {
+      raw: orFilterXml('EmailAddress', batch),
+    });
+    for (const row of results) {
+      if (row?.EmailAddress && row?.SubscriberKey) {
+        map.set(row.EmailAddress.toLowerCase(), row.SubscriberKey);
+      }
+    }
+  });
+  return map;
 }
 
 // Borrado global asíncrono del Contact/Subscriber dueño de cada

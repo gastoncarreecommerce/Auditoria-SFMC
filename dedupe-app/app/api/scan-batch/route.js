@@ -12,7 +12,7 @@ export const maxDuration = 60;
 
 export async function POST(request) {
   try {
-    const { customerKey, confirmName, page } = await request.json();
+    const { customerKey, confirmName, page, idFields: cachedIdFields } = await request.json();
     if (!customerKey || !confirmName || !page) {
       return NextResponse.json({ error: 'Faltan customerKey, confirmName o page' }, { status: 400 });
     }
@@ -28,7 +28,10 @@ export async function POST(request) {
       return NextResponse.json({ error: `El nombre no coincide. La DE real se llama "${realName}".` }, { status: 400 });
     }
 
-    const idFields = await getIdFields(customerKey);
+    // El cliente cachea idFields desde la respuesta de la página 1 y lo
+    // reenvía en las siguientes — se ahorra un Retrieve SOAP por página,
+    // que en una DE de millones de filas y miles de páginas suma bastante.
+    const idFields = cachedIdFields || (await getIdFields(customerKey));
     const hasSubscriberKeyField = idFields.some((f) => f.type === 'subscriberkey');
     const hasEmailField = idFields.some((f) => f.type === 'email');
     if (!hasSubscriberKeyField && !hasEmailField) {
@@ -67,11 +70,10 @@ export async function POST(request) {
     }
 
     const emailsToResolve = needsLookup.filter((r) => r.identifier).map((r) => r.identifier);
-    const resolvedKeys = await resolveSubscriberKeysByEmail(emailsToResolve);
-    let resolvedIdx = 0;
+    const resolvedMap = await resolveSubscriberKeysByEmail(emailsToResolve);
     const lookedUp = needsLookup.map((r) => {
       if (!r.identifier) return { identifier: null, subscriberKey: null };
-      return { identifier: r.identifier, subscriberKey: resolvedKeys[resolvedIdx++] };
+      return { identifier: r.identifier, subscriberKey: resolvedMap.get(r.identifier.toLowerCase()) || null };
     });
 
     const resolved = [...direct, ...lookedUp].filter((r) => r.subscriberKey);
@@ -83,6 +85,7 @@ export async function POST(request) {
       rowsInPage: rows.length,
       hasMore,
       totalRows,
+      idFields, // el cliente lo cachea y lo reenvía en las próximas páginas
       resolved, // [{ identifier, subscriberKey }]
       unresolvedCount: unresolved.length,
       unresolvedIdentifiers: unresolved.map((r) => r.identifier).filter(Boolean),
