@@ -1,0 +1,77 @@
+name: Borrar contactos fuera de una DE (cuenta completa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_de_customer_key:
+        description: "Clave Externa de la DE a CONSERVAR (ej. Base Maestra NUEVA)"
+        required: true
+        default: "5B8FBB43-7840-4FE9-9E2E-DAA507FAE29B"
+      keep_field:
+        description: "Campo de esa DE que es la Clave del Suscriptor real"
+        required: true
+        default: "DNI__c"
+      dry_run:
+        description: "true = solo cuenta y genera el CSV, no borra nada"
+        required: true
+        default: "true"
+      submit_delete:
+        description: "true = manda el borrado real a SFMC (solo tiene efecto si dry_run es false)"
+        required: true
+        default: "false"
+
+jobs:
+  delete-outside-de:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Restaurar progreso de corridas anteriores (delete-outside-de.db)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            delete-outside-de.db
+            delete-outside-de.db-wal
+            delete-outside-de.db-shm
+          key: delete-outside-de-db-${{ github.run_id }}
+          restore-keys: |
+            delete-outside-de-db-
+
+      - name: Escanear cuenta y (si corresponde) borrar
+        run: node delete-outside-de.js
+        env:
+          SFMC_CLIENT_ID: ${{ secrets.SFMC_CLIENT_ID }}
+          SFMC_CLIENT_SECRET: ${{ secrets.SFMC_CLIENT_SECRET }}
+          SFMC_SUBDOMAIN: ${{ secrets.SFMC_SUBDOMAIN }}
+          SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
+          KEEP_DE_CUSTOMER_KEY: ${{ inputs.keep_de_customer_key }}
+          KEEP_FIELD: ${{ inputs.keep_field }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SUBMIT_DELETE: ${{ inputs.submit_delete }}
+          TIME_BUDGET_MINUTES: "330"
+
+      - name: Guardar progreso para la próxima corrida
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            delete-outside-de.db
+            delete-outside-de.db-wal
+            delete-outside-de.db-shm
+          key: delete-outside-de-db-${{ github.run_id }}
+
+      - name: Subir reporte como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delete-outside-de-report
+          path: delete-outside-de-report.csv
+          if-no-files-found: ignore
