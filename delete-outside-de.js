@@ -233,6 +233,7 @@ async function scanAllSubscribers() {
   let continueId = null;
   let more = true;
   let scanned = countScanned();
+  let errorRetries = 0;
   while (more && !timeIsUp()) {
     const requestXml = continueId
       ? `<ContinueRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI"><ContinueRequest>${continueId}</ContinueRequest></ContinueRequestMsg>`
@@ -240,10 +241,29 @@ async function scanAllSubscribers() {
            <RetrieveRequest><ObjectType>Subscriber</ObjectType><Properties>SubscriberKey</Properties></RetrieveRequest>
          </RetrieveRequestMsg>`;
     const body = await soapRequest(requestXml);
-    const msg = continueId ? body.ContinueResponseMsg : body.RetrieveResponseMsg;
+    // Cuando falla una continuación, SFMC a veces la envuelve igual bajo
+    // RetrieveResponseMsg en vez de ContinueResponseMsg — no hay que
+    // asumir la clave según el tipo de request, hay que usar la que
+    // efectivamente vino.
+    const msg = body.ContinueResponseMsg || body.RetrieveResponseMsg;
     if (!msg) {
       throw new Error(`Respuesta SOAP sin RetrieveResponseMsg/ContinueResponseMsg: ${JSON.stringify(body).slice(0, 500)}`);
     }
+    if (msg.OverallStatus && msg.OverallStatus !== 'OK' && msg.OverallStatus !== 'MoreDataAvailable') {
+      console.log(`[fase 2] SFMC devolvió un error de estado: ${JSON.stringify(msg).slice(0, 500)}`);
+      errorRetries++;
+      if (errorRetries > MAX_FETCH_ATTEMPTS) {
+        throw new Error(`Fase 2: demasiados errores de SFMC seguidos, último: ${JSON.stringify(msg).slice(0, 500)}`);
+      }
+      // Se reintenta desde el ÚLTIMO ContinueRequest exitoso (o desde el
+      // principio si el error fue en la primera página) — un token de
+      // continuación roto no se arregla reintentando, así que si sigue
+      // fallando 2 veces con el mismo continueId, se reinicia el barrido.
+      if (errorRetries >= 2) continueId = null;
+      await sleep(1000 * 2 ** Math.min(errorRetries, 5));
+      continue;
+    }
+    errorRetries = 0;
     let results = msg.Results || [];
     if (!Array.isArray(results)) results = [results];
     // Diagnóstico: si SFMC devuelve 0 resultados sin "MoreDataAvailable",
