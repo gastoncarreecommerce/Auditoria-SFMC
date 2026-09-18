@@ -19,6 +19,10 @@ on:
         description: "true = manda el borrado real a SFMC (solo tiene efecto si dry_run es false)"
         required: true
         default: "false"
+      reset_phase2:
+        description: "true = borra el checkpoint de la fase 2 antes de arrancar (usar si una corrida anterior la marcó completa con 0 resultados por un problema de permisos)"
+        required: true
+        default: "false"
 
 jobs:
   delete-outside-de:
@@ -56,6 +60,7 @@ jobs:
           KEEP_FIELD: ${{ inputs.keep_field }}
           DRY_RUN: ${{ inputs.dry_run }}
           SUBMIT_DELETE: ${{ inputs.submit_delete }}
+          RESET_PHASE2: ${{ inputs.reset_phase2 }}
           TIME_BUDGET_MINUTES: "330"
 
       - name: Guardar progreso para la próxima corrida

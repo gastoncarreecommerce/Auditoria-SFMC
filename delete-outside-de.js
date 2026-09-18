@@ -40,6 +40,7 @@ const {
   TIME_BUDGET_MINUTES,
   KEEP_SCAN_PAGE_SIZE,
   KEEP_SCAN_CONCURRENCY,
+  RESET_PHASE2,
 } = process.env;
 
 if (!SFMC_CLIENT_ID || !SFMC_CLIENT_SECRET || !SFMC_SUBDOMAIN) {
@@ -331,9 +332,22 @@ async function submitDeletes() {
   }
 }
 
+// Antes del fix de diagnóstico, una fase 2 que escaneaba 0 por falta de
+// permisos igual quedaba guardada como "completa" en el .db cacheado — el
+// fix evita que pase de nuevo, pero no limpia lo que ya quedó mal en una
+// corrida anterior. RESET_PHASE2=true borra ese estado (y lo que se haya
+// insertado en delete_keys) antes de arrancar, sin tener que ir a borrar
+// el caché de GitHub Actions a mano.
+function resetPhase2() {
+  console.log('[reset] RESET_PHASE2=true — limpiando el checkpoint de la fase 2 antes de arrancar.');
+  db.exec('DELETE FROM delete_keys; DELETE FROM meta WHERE k IN (\'phase2_done\', \'subscribers_scanned\');');
+}
+
 async function main() {
   console.log(`Conservar: ${KEEP_DE_CUSTOMER_KEY} (campo ${IDENTIFIER_FIELD})`);
   console.log(`Modo: ${IS_DRY_RUN ? 'DRY RUN (no borra nada)' : SHOULD_SUBMIT ? 'BORRADO REAL' : 'solo escaneo (SUBMIT_DELETE no es true)'}`);
+
+  if (RESET_PHASE2 === 'true') resetPhase2();
 
   await scanKeepDe();
   if (getMeta('phase1_done') !== 'true') {
