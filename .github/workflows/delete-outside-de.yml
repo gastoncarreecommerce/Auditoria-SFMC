@@ -4,25 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       keep_de_customer_key:
-        description: "Clave Externa de la DE a CONSERVAR (ej. Base Maestra NUEVA)"
+        description: "DE a conservar (Clave Externa)"
         required: true
         default: "5B8FBB43-7840-4FE9-9E2E-DAA507FAE29B"
       keep_field:
-        description: "Campo de esa DE que es la Clave del Suscriptor real"
+        description: "Campo con la Clave del Suscriptor"
         required: true
         default: "DNI__c"
       dry_run:
-        description: "true = solo cuenta y genera el CSV, no borra nada"
-        required: true
-        default: "true"
+        description: "Modo prueba (no borra nada, solo genera el CSV)"
+        type: boolean
+        default: true
       submit_delete:
-        description: "true = manda el borrado real a SFMC (solo tiene efecto si dry_run es false)"
-        required: true
-        default: "false"
+        description: "Enviar el borrado real (solo si Modo prueba está destildado)"
+        type: boolean
+        default: false
       reset_phase2:
-        description: "true = borra el checkpoint de la fase 2 antes de arrancar (usar si una corrida anterior la marcó completa con 0 resultados por un problema de permisos)"
-        required: true
-        default: "false"
+        description: "Reiniciar desde cero el escaneo de toda la cuenta"
+        type: boolean
+        default: false
 
 jobs:
   delete-outside-de:
