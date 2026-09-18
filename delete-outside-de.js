@@ -240,8 +240,21 @@ async function scanAllSubscribers() {
          </RetrieveRequestMsg>`;
     const body = await soapRequest(requestXml);
     const msg = continueId ? body.ContinueResponseMsg : body.RetrieveResponseMsg;
+    if (!msg) {
+      throw new Error(`Respuesta SOAP sin RetrieveResponseMsg/ContinueResponseMsg: ${JSON.stringify(body).slice(0, 500)}`);
+    }
     let results = msg.Results || [];
     if (!Array.isArray(results)) results = [results];
+    // Diagnóstico: si SFMC devuelve 0 resultados sin "MoreDataAvailable",
+    // puede ser que la cuenta esté vacía (raro) o, más probable, que al
+    // paquete de API le falte el permiso Contacts → List and Subscribers:
+    // Read — en ese caso SFMC no tira un SOAP Fault, solo devuelve un
+    // OverallStatus distinto (o vacío) sin explicarlo, así que se loguea
+    // completo para poder diagnosticarlo.
+    if (results.length === 0) {
+      console.log(`[fase 2] respuesta sin resultados — OverallStatus="${msg.OverallStatus}" StatusMessage="${msg.OverallStatusMessage || msg.StatusMessage || ''}"`);
+      if (scanned === 0) console.log(`[fase 2] respuesta completa para diagnóstico: ${JSON.stringify(msg).slice(0, 1000)}`);
+    }
 
     const tx = db.transaction((rows) => {
       for (const row of rows) {
@@ -264,8 +277,17 @@ async function scanAllSubscribers() {
     }
   }
   if (!more) {
-    setMeta.run('phase2_done', 'true');
-    console.log(`[fase 2] completa — ${scanned.toLocaleString('es-AR')} escaneados, ${countDelete().toLocaleString('es-AR')} a borrar`);
+    // Si terminó (sin MoreDataAvailable) pero no escaneó nada, casi seguro
+    // es un problema de permisos (falta Contacts → List and Subscribers:
+    // Read en el paquete), no que la cuenta esté realmente vacía — no se
+    // marca como "completa" para que la próxima corrida lo reintente en
+    // vez de quedar salteada para siempre por el checkpoint.
+    if (scanned === 0) {
+      console.log('[fase 2] ADVERTENCIA: se escanearon 0 Subscribers. Lo más probable es que al paquete de API le falte el permiso "Contacts → List and Subscribers: Read". No se marca la fase como completa — revisá el permiso y volvé a correr el workflow.');
+    } else {
+      setMeta.run('phase2_done', 'true');
+      console.log(`[fase 2] completa — ${scanned.toLocaleString('es-AR')} escaneados, ${countDelete().toLocaleString('es-AR')} a borrar`);
+    }
   } else {
     console.log('[fase 2] tiempo agotado — el ContinueRequest de SFMC no sobrevive a una corrida nueva, así que la próxima corrida repite la fase 2 desde el principio (es idempotente, no duplica nada, solo repite trabajo).');
   }
