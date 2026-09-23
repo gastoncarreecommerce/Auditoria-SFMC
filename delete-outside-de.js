@@ -10,9 +10,12 @@
 //   1. Escanea la DE a conservar y guarda su campo identificador (por
 //      default DNI__c, que en esta cuenta ES la Clave del Suscriptor)
 //      en la tabla keep_keys.
-//   2. Recorre el objeto Subscriber de SFMC completo (sin filtro, con
-//      ContinueRequest) y guarda en delete_keys cualquier SubscriberKey
-//      que NO esté en keep_keys.
+//   2. Si se pasa DELETE_DE_CUSTOMER_KEY, lee directo esa DE (ya
+//      calculada por una Query Activity de Automation Studio contra
+//      _Subscribers — ver README) en vez de recorrer el objeto
+//      Subscriber completo por SOAP, que se topa con un throttle muy
+//      agresivo de SFMC en cuentas grandes. Sin esa variable, cae al
+//      barrido SOAP original (más lento, se deja como respaldo).
 //   3. Si DRY_RUN no es "true", manda el borrado global asíncrono
 //      (Contact Delete) en tandas de 500 por cada fila de delete_keys
 //      todavía no enviada.
@@ -41,6 +44,7 @@ const {
   KEEP_SCAN_PAGE_SIZE,
   KEEP_SCAN_CONCURRENCY,
   RESET_PHASE2,
+  DELETE_DE_CUSTOMER_KEY,
 } = process.env;
 
 if (!SFMC_CLIENT_ID || !SFMC_CLIENT_SECRET || !SFMC_SUBDOMAIN) {
@@ -228,6 +232,59 @@ async function scanKeepDe() {
   }
 }
 
+// --- Fase 2 (alternativa): leer una DE ya calculada por una Query
+// Activity de Automation Studio (SELECT SubscriberKey FROM _Subscribers
+// LEFT JOIN <DE a conservar> ... WHERE ... IS NULL), en vez de recorrer
+// el objeto Subscriber completo por SOAP. El cálculo pesado (el JOIN
+// contra 21M de filas) lo hace SFMC del lado del servidor — evita por
+// completo el throttle que hacía inviable el barrido por API.
+async function scanDeleteDeFromQuery() {
+  if (getMeta('phase2_done') === 'true') {
+    console.log(`[fase 2] ya completada en una corrida anterior — ${countDelete()} a borrar de ${countScanned()} escaneados`);
+    return;
+  }
+  console.log(`[fase 2] leyendo ${DELETE_DE_CUSTOMER_KEY} (ya calculada por la Query Activity)...`);
+  let page = Number(getMeta('phase2_last_page') || 0) + 1;
+  let more = true;
+  let scanned = countScanned();
+  while (more && !timeIsUp()) {
+    const pages = Array.from({ length: PAGE_CONCURRENCY }, (_, i) => page + i);
+    const results = await Promise.all(pages.map((p) => fetchRowsetPage(DELETE_DE_CUSTOMER_KEY, p)));
+    let anyItems = false;
+    const insertMany = db.transaction((rowsets) => {
+      for (const data of rowsets) {
+        const items = data.items || [];
+        if (items.length > 0) anyItems = true;
+        for (const item of items) {
+          const flat = { ...(item.keys || {}), ...(item.values || {}) };
+          const flatLower = {};
+          for (const k in flat) flatLower[k.toLowerCase()] = flat[k];
+          const value = flat['SubscriberKey'] ?? flatLower['subscriberkey'];
+          if (value) {
+            insertDeleteKey.run(String(value).trim());
+            scanned++;
+          }
+        }
+        if (items.length < PAGE_SIZE) more = false;
+      }
+    });
+    insertMany(results);
+    page += PAGE_CONCURRENCY;
+    setMeta.run('phase2_last_page', String(page - 1));
+    setMeta.run('subscribers_scanned', String(scanned));
+    if (!anyItems) more = false;
+    if (page % 500 < PAGE_CONCURRENCY) {
+      console.log(`[fase 2] página ~${page} — ${scanned.toLocaleString('es-AR')} escaneados, ${countDelete().toLocaleString('es-AR')} a borrar`);
+    }
+  }
+  if (!more) {
+    setMeta.run('phase2_done', 'true');
+    console.log(`[fase 2] completa — ${scanned.toLocaleString('es-AR')} escaneados, ${countDelete().toLocaleString('es-AR')} a borrar`);
+  } else {
+    console.log(`[fase 2] tiempo agotado, se resume en la próxima corrida desde la página ${page}`);
+  }
+}
+
 // --- Fase 2: recorrer TODOS los Subscriber de la cuenta ---
 async function scanAllSubscribers() {
   if (getMeta('phase2_done') === 'true') {
@@ -383,7 +440,11 @@ async function main() {
     return;
   }
 
-  await scanAllSubscribers();
+  if (DELETE_DE_CUSTOMER_KEY) {
+    await scanDeleteDeFromQuery();
+  } else {
+    await scanAllSubscribers();
+  }
   if (getMeta('phase2_done') !== 'true') {
     console.log('Fase 2 sin terminar — cortando acá, se resume en la próxima corrida.');
     return;

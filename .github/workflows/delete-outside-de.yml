@@ -11,6 +11,10 @@ on:
         description: "Campo con la Clave del Suscriptor"
         required: true
         default: "DNI__c"
+      delete_de_customer_key:
+        description: "DE con la lista a borrar, ya calculada por Automation Studio (Clave Externa; vacío = recorrer la cuenta por SOAP, más lento)"
+        required: false
+        default: ""
       dry_run:
         description: "Modo prueba (no borra nada, solo genera el CSV)"
         type: boolean
@@ -58,6 +62,7 @@ jobs:
           SFMC_PARENT_ACCOUNT_ID: ${{ secrets.SFMC_PARENT_ACCOUNT_ID }}
           KEEP_DE_CUSTOMER_KEY: ${{ inputs.keep_de_customer_key }}
           KEEP_FIELD: ${{ inputs.keep_field }}
+          DELETE_DE_CUSTOMER_KEY: ${{ inputs.delete_de_customer_key }}
           DRY_RUN: ${{ inputs.dry_run }}
           SUBMIT_DELETE: ${{ inputs.submit_delete }}
           RESET_PHASE2: ${{ inputs.reset_phase2 }}
