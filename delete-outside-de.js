@@ -64,6 +64,11 @@ const PAGE_CONCURRENCY = Number(KEEP_SCAN_CONCURRENCY) || 8;
 const TIME_BUDGET_MS = (Number(TIME_BUDGET_MINUTES) || 330) * 60 * 1000;
 const START_TIME = Date.now();
 const MAX_FETCH_ATTEMPTS = 6;
+// El retrieve masivo de Subscriber en una cuenta de ~21M parece toparse
+// con un throttle de SFMC bastante agresivo (éxito ~1 de cada 15-25
+// intentos en la práctica) — con backoff exponencial (hasta 90s) hacen
+// falta bastantes reintentos para que una página termine pasando.
+const MAX_SUBSCRIBER_ERROR_RETRIES = 60;
 const SUBMIT_CHUNK = 500;
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
@@ -250,17 +255,20 @@ async function scanAllSubscribers() {
       throw new Error(`Respuesta SOAP sin RetrieveResponseMsg/ContinueResponseMsg: ${JSON.stringify(body).slice(0, 500)}`);
     }
     if (msg.OverallStatus && msg.OverallStatus !== 'OK' && msg.OverallStatus !== 'MoreDataAvailable') {
-      console.log(`[fase 2] SFMC devolvió un error de estado: ${JSON.stringify(msg).slice(0, 500)}`);
       errorRetries++;
-      if (errorRetries > MAX_FETCH_ATTEMPTS) {
-        throw new Error(`Fase 2: demasiados errores de SFMC seguidos, último: ${JSON.stringify(msg).slice(0, 500)}`);
+      // El patrón real (falla casi siempre, éxito ocasional) es un
+      // throttle de SFMC en el retrieve masivo de Subscriber, no un token
+      // de continuación roto — reiniciar el barrido con continueId=null
+      // solo tira a la basura el progreso ya hecho sin arreglar nada, así
+      // que se reintenta SIEMPRE con el mismo continueId (o la misma
+      // primera página si todavía no arrancó), con un backoff más largo.
+      if (errorRetries % 5 === 0) {
+        console.log(`[fase 2] SFMC devolvió error de estado (van ${errorRetries} seguidos) — ${JSON.stringify(msg).slice(0, 300)}`);
       }
-      // Se reintenta desde el ÚLTIMO ContinueRequest exitoso (o desde el
-      // principio si el error fue en la primera página) — un token de
-      // continuación roto no se arregla reintentando, así que si sigue
-      // fallando 2 veces con el mismo continueId, se reinicia el barrido.
-      if (errorRetries >= 2) continueId = null;
-      await sleep(1000 * 2 ** Math.min(errorRetries, 5));
+      if (errorRetries > MAX_SUBSCRIBER_ERROR_RETRIES) {
+        throw new Error(`Fase 2: demasiados errores de SFMC seguidos (${errorRetries}), último: ${JSON.stringify(msg).slice(0, 500)}`);
+      }
+      await sleep(Math.min(5000 * 1.5 ** errorRetries, 90_000));
       continue;
     }
     errorRetries = 0;
