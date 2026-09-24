@@ -73,7 +73,15 @@ const MAX_FETCH_ATTEMPTS = 6;
 // intentos en la práctica) — con backoff exponencial (hasta 90s) hacen
 // falta bastantes reintentos para que una página termine pasando.
 const MAX_SUBSCRIBER_ERROR_RETRIES = 60;
-const SUBMIT_CHUNK = 500;
+// La documentación de SFMC dice que un mismo "proceso" de borrado admite
+// hasta 1.000.000 de filas (el mismo motor que usa la pantalla de la UI
+// con ese límite) — 500 era una elección conservadora de cuando esto se
+// probó por primera vez, nunca validada a mayor escala. Con cuentas de
+// millones de filas, 500 por tanda significa decenas de miles de llamadas
+// en serie. Se sube a 50.000: reduce muchísimo la cantidad de llamadas
+// sin acercarse al límite documentado ni arriesgar un cuerpo de request
+// demasiado grande (nunca probado tampoco).
+const SUBMIT_CHUNK = Number(process.env.SUBMIT_CHUNK) || 50_000;
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
 
